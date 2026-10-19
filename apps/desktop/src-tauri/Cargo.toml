@@ -1,0 +1,50 @@
+[package]
+name = "dandelion-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Thin Tauri host for dandelion-core. Must not implement the agent loop or talk to models directly."
+
+[lib]
+name = "dandelion_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "dandelion-desktop"
+path = "src/main.rs"
+
+[features]
+# 生产构建（或 devUrl 未设）时启用：tauri 据此关闭 cfg(dev)，
+# 从嵌入资产加载前端而不是 devUrl。`tauri build` 会自动传递此 feature。
+# Do NOT remove — 缺失时 release exe 仍会去连 http://localhost:1420 白屏。
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+dandelion-core = { path = "../../../crates/dandelion-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2", features = ["unstable"] }
+rfd = "0.15"
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+dunce = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tauri-plugin-updater = "2"
+
+[target.'cfg(windows)'.dependencies]
+# 仅 Windows 启用：跨 DPI 显示器拖拽时强制 PerMonitorV2，避免窗口爆缩
+windows = { version = "0.58", features = ["Win32_UI_HiDpi"] }
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+tempfile = "3"
+walkdir = "2"

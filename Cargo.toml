@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = ["crates/dandelion-core", "crates/dandelion-cli", "apps/desktop/src-tauri"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+repository = "https://github.com/luoluopyq/dandelion"
+rust-version = "1.88"
+authors = ["Dandelion"]
+description = "Local-first desktop AI agent (core + CLI; Tauri hosts the same core)"
+
+[workspace.dependencies]
+dandelion-core = { path = "crates/dandelion-core", version = "0.0.1" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "process", "io-util", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+directories = "6"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+async-trait = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+regex = "1"
+glob = "0.3"
+dunce = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+rmcp = { version = "3.2.0", default-features = false, features = [
+    "client",
+    "reqwest",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
+croner = "3"
+http = "1"
+sha2 = "0.10"
+sqlite-vec = "0.1.9"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,167 @@
+name: release
+
+# Produces installers for every supported platform:
+#   windows-x64  -> Dandelion_<version>_x64-setup.exe   (NSIS, per-user install)
+#   macos-universal -> Dandelion_<version>_universal.dmg (Apple silicon + Intel)
+#
+# Trigger: push a tag like v0.1.0, or run manually from the Actions tab.
+#
+# Optional code signing (unsigned builds still work, users get a Gatekeeper /
+# SmartScreen warning): provide these repository secrets.
+#   Apple: APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD,
+#          APPLE_SIGNING_IDENTITY, APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
+#   Windows: WINDOWS_CERTIFICATE (base64 .pfx), WINDOWS_CERTIFICATE_PASSWORD
+# When the Apple secrets are absent the macOS build is ad-hoc/unsigned.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: windows-x64 (nsis)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Verify account service configuration
+        shell: bash
+        env:
+          OPERATIONS_URL: ${{ vars.DLN_OPERATIONS_URL }}
+        run: test -n "$OPERATIONS_URL" || { echo "Missing DLN_OPERATIONS_URL"; exit 1; }
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Prepare consistent release version
+        shell: bash
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            python scripts/prepare-release.py "$RELEASE_REF" --out apps/desktop/src-tauri/tauri.release.generated.json
+          else
+            python scripts/prepare-release.py --out apps/desktop/src-tauri/tauri.release.generated.json
+          fi
+
+      - name: Build NSIS installer
+        working-directory: apps/desktop
+        env:
+          DLN_OPERATIONS_URL: ${{ vars.DLN_OPERATIONS_URL }}
+          DLN_UPDATE_PUBLIC_KEY: ${{ vars.DLN_UPDATE_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- --bundles nsis --config src-tauri/tauri.bundle.conf.json --config src-tauri/tauri.release.generated.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dandelion-windows-x64
+          if-no-files-found: error
+          path: |
+            target/release/bundle/nsis/*.exe
+
+  macos:
+    name: macos-universal (dmg)
+    # macos-14 runners are Apple silicon; a universal build needs both targets,
+    # which is why this job cross-compiles x86_64 alongside aarch64.
+    runs-on: macos-14
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: macos-universal
+
+      - name: Verify account service configuration
+        shell: bash
+        env:
+          OPERATIONS_URL: ${{ vars.DLN_OPERATIONS_URL }}
+        run: test -n "$OPERATIONS_URL" || { echo "Missing DLN_OPERATIONS_URL"; exit 1; }
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Import Apple signing certificate
+        if: ${{ env.APPLE_CERTIFICATE != '' }}
+        env:
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import certificate.p12 -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k actions build.keychain
+          rm certificate.p12
+
+      - name: Prepare consistent release version
+        shell: bash
+        env:
+          RELEASE_REF: ${{ github.ref_name }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            python scripts/prepare-release.py "$RELEASE_REF" --out apps/desktop/src-tauri/tauri.release.generated.json
+          else
+            python scripts/prepare-release.py --out apps/desktop/src-tauri/tauri.release.generated.json
+          fi
+
+      - name: Build universal dmg
+        working-directory: apps/desktop
+        env:
+          DLN_OPERATIONS_URL: ${{ vars.DLN_OPERATIONS_URL }}
+          DLN_UPDATE_PUBLIC_KEY: ${{ vars.DLN_UPDATE_PUBLIC_KEY }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run tauri build -- --target universal-apple-darwin --bundles app,dmg --config src-tauri/tauri.bundle.conf.json --config src-tauri/tauri.release.generated.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dandelion-macos-universal
+          if-no-files-found: error
+          path: |
+            target/universal-apple-darwin/release/bundle/dmg/*.dmg
+
+  release:
+    name: attach installers to release
+    needs: [windows, macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true

@@ -1,0 +1,8 @@
+{
+  "dandelion.baseUrl": "http://192.168.183.25:9911/v1",
+  "dandelion.defaultModel": "Qwen3.8-Flash-Next",
+  "dandelion.thinkingIntensity": "xhigh",
+  "dandelion.permissionMode": "ask",
+  "dandelion.temperature": 0.2,
+  "dandelion.maxTokens": 8192
+}

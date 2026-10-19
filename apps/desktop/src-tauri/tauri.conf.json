@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Dandelion",
+  "version": "0.0.1",
+  "identifier": "com.dandelion.desktop",
+  "build": {
+    "beforeDevCommand": {
+      "cwd": "..",
+      "script": "npm run dev"
+    },
+    "beforeBuildCommand": {
+      "cwd": "..",
+      "script": "npm run build"
+    },
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "蒲公英",
+        "width": 1120,
+        "height": 720,
+        "minWidth": 900,
+        "minHeight": 600,
+        "decorations": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; connect-src 'self' ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420; script-src 'self' 'unsafe-eval' 'unsafe-inline' http://localhost:1420; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "publisher": "Dandelion",
+    "category": "DeveloperTool",
+    "shortDescription": "A local-first Agent runtime.",
+    "longDescription": "Dandelion is a harness-shaped local Agent runtime: one agent_loop (complete -> tools -> persist) that skills, MCP servers, hooks and subagents all plug into.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": []
+    }
+  }
+}

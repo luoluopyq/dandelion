@@ -1,0 +1,62 @@
+# Rust / Tauri build output
+/target/
+**/target/
+/target-codex-check/
+**/*.rs.bk
+
+# IDE and local editor state
+.cursor/
+.idea/
+.vscode/
+.workbuddy/
+
+# Local environment and secrets (keep sample files versioned)
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Native binaries, crash data, and OS metadata
+*.pdb
+*.exe
+!crates/**/src/**
+.DS_Store
+Thumbs.db
+
+# Staged bundle extras produced by the before-build scripts (built, not source)
+apps/desktop/src-tauri/resources/
+
+# Python runtime cache
+__pycache__/
+*.py[cod]
+
+# JavaScript build/cache output
+node_modules/
+apps/desktop/dist/
+apps/desktop/vite-dev.log
+apps/desktop/src-tauri/gen/
+.vite/
+coverage/
+
+# Per-machine runtime state and scratch work. These are not Dandelion source.
+apps/desktop/src-tauri/.dandelion/
+apps/desktop/src-tauri/go-dfs/
+apps/desktop/src-tauri/python-bfs/
+apps/desktop/src-tauri/python-dfs/
+apps/desktop/src-tauri/python-sort/
+
+# Temporary screenshots saved at the repository root
+/image.png
+/image-*.png
+
+# Local benchmark checkouts and downloaded tools
+/.benchmarks/
+
+# Local video exports; keep them on disk, outside the source tree history
+/video-output/
+
+# Local operations databases, bootstrap credentials and binary
+/.local/
+/apps/operations/data/
+/apps/operations/operations
+apps/desktop/src-tauri/tauri.release.generated.json

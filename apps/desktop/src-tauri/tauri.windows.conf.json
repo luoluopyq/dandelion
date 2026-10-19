@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "powershell -NoProfile -ExecutionPolicy Bypass -File ..\\..\\scripts\\g5-desktop-before-build.ps1"
+  },
+  "bundle": {
+    "targets": ["nsis"],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false,
+        "compression": "lzma",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "startMenuFolder": "Dandelion"
+      }
+    }
+  }
+}

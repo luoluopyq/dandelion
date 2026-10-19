@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "bash ../../scripts/darwin-before-build.sh"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "蒲公英",
+        "width": 1120,
+        "height": 720,
+        "minWidth": 900,
+        "minHeight": 600,
+        "decorations": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "dandelion-desktop",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "tsc src/lib/knowledge-items.ts src/lib/memory-view.ts src/lib/knowledge-citations.ts src/lib/wiki-view.ts src/lib/wiki-evidence.ts src/lib/wiki-identity.ts src/lib/space-gate.ts --outDir node_modules/.wiki-view-test --target es2022 --module es2022 --strict --skipLibCheck && node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.4",
+    "dompurify": "^3.2.6",
+    "geist": "^1.5.1",
+    "marked": "^15.0.12",
+    "naive-ui": "^2.43.1",
+    "pinia": "^3.0.3",
+    "vue": "^3.5.22"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.3",
+    "@vitejs/plugin-vue": "^5.2.4",
+    "typescript": "~5.8.3",
+    "vite": "^6.3.5",
+    "vue-tsc": "^2.2.10"
+  },
+  "license": "PolyForm-Noncommercial-1.0.0"
+}

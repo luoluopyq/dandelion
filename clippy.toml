@@ -1,0 +1,3 @@
+# Keep G0/G1 APIs small enough that CLI and Tauri can share them.
+cognitive-complexity-threshold = 30
+too-many-arguments-threshold = 8
