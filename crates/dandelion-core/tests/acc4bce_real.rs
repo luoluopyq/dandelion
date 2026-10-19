@@ -3,7 +3,7 @@
 //! Every test here is `#[ignore]`d: it talks to the REAL configured model and
 //! (where a workspace is involved) REAL data, copied into an isolated data
 //! dir so the user's live `dandelion` state is never mutated. REA
-//! (`E:\ai-open-resource\rea`) is read strictly read-only: the build runs on
+//! (configured with `DLN_ACC_REA`) is read strictly read-only: the build runs on
 //! a copy and the original's `git status --porcelain` is checked afterwards.
 //!
 //! Run (one scenario at a time, evidence lands under DLN_ACC_OUT):
@@ -11,7 +11,7 @@
 //!
 //! Env: DLN_ACC_DATA (real data dir, default %APPDATA%\dandelion\dandelion\data)
 //!      DLN_ACC_OUT (evidence dir, default %TEMP%\dln-acc-4bce)
-//!      DLN_ACC_REA (REA checkout, default E:\ai-open-resource\rea)
+//!      DLN_ACC_REA (required REA checkout path)
 //!
 //! API key values are never printed — evidence records model *answers*, the
 //! harness reads the key only through `Settings::load` on the isolated copy.
@@ -50,7 +50,9 @@ fn out_root() -> PathBuf {
 }
 
 fn rea_path() -> PathBuf {
-    env_path("DLN_ACC_REA", "E:\\ai-open-resource\\rea")
+    std::env::var_os("DLN_ACC_REA")
+        .map(PathBuf::from)
+        .expect("set DLN_ACC_REA to the REA checkout path")
 }
 
 /// Evidence log: every assertion-relevant fact is appended to a durable file

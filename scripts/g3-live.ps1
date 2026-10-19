@@ -1,8 +1,9 @@
-# G3 live check: same LAN vLLM endpoint as g1-live.ps1, plus session/cron/memory CLI.
+# G3 live check: configured model endpoint plus session/cron/memory CLI.
 # Usage (repo root):
 #   powershell -File scripts/g3-live.ps1
+# Required env:
+#   $env:DANDELION_BASE_URL="http://127.0.0.1:11434/v1"
 # Optional env:
-#   $env:DANDELION_BASE_URL="http://192.168.183.25:9911/v1"
 #   $env:DANDELION_MODEL="Qwen3.8-Flash-Next"
 #   $env:DANDELION_THINKING_INTENSITY="low"
 
@@ -10,7 +11,7 @@ $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $PSScriptRoot)
 
 if (-not $env:DANDELION_BASE_URL) {
-    $env:DANDELION_BASE_URL = "http://192.168.183.25:9911/v1"
+    throw "Set DANDELION_BASE_URL to the endpoint for this live check."
 }
 if (-not $env:DANDELION_MODEL) {
     $env:DANDELION_MODEL = "Qwen3.8-Flash-Next"

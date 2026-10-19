@@ -3673,8 +3673,8 @@ mod tests {
     #[test]
     fn strips_models_suffix() {
         assert_eq!(
-            Settings::normalize_base_url("http://192.168.183.25:9911/v1/models"),
-            "http://192.168.183.25:9911/v1"
+            Settings::normalize_base_url("http://127.0.0.1:11434/v1/models"),
+            "http://127.0.0.1:11434/v1"
         );
     }
 

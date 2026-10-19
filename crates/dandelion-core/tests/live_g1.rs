@@ -1,7 +1,7 @@
 //! Live smoke against a configured OpenAI-compatible endpoint.
 //!
 //! Default (override with env):
-//!   DANDELION_BASE_URL=http://192.168.183.25:9911/v1
+//!   DANDELION_BASE_URL=http://127.0.0.1:11434/v1
 //!   DANDELION_MODEL=Qwen3.8-Flash-Next
 //!
 //! Run:
@@ -27,7 +27,7 @@ fn live_base_url() -> String {
     std::env::var("DANDELION_BASE_URL")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "http://192.168.183.25:9911/v1".into())
+        .unwrap_or_else(|| "http://127.0.0.1:11434/v1".into())
 }
 
 fn live_model() -> String {

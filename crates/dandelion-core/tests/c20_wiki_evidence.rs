@@ -128,9 +128,13 @@ fn workspaces_keep_isolated_indexes() {
 /// Real-repo smoke (acceptance target). Run with:
 /// `cargo test -p dandelion-core --test c20_wiki_evidence -- --ignored --nocapture`
 #[test]
-#[ignore = "requires E:\\ai-open-resource\\rea on disk"]
+#[ignore = "requires DLN_ACC_REA to point to a REA checkout"]
 fn rea_scan_smoke() {
-    let ws = std::path::Path::new(r"E:\ai-open-resource\rea");
+    let Some(ws) = std::env::var_os("DLN_ACC_REA") else {
+        eprintln!("DLN_ACC_REA is not set, skipping");
+        return;
+    };
+    let ws = std::path::Path::new(&ws);
     if !ws.join("package.json").exists() {
         eprintln!("rea not present, skipping");
         return;

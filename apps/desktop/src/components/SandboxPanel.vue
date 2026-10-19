@@ -10,7 +10,7 @@
     <form class="asset" @submit.prevent="onAddPath">
       <label>
         手动输入目录路径
-        <input v-model="manualPath" placeholder="/Users/puyq/Desktop" />
+        <input v-model="manualPath" placeholder="/Users/you/Desktop" />
       </label>
       <button type="submit">添加路径</button>
     </form>

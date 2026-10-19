@@ -19,8 +19,8 @@ test("kind=raw 的依据指向源码证据（带行号），其余按 Wiki 页�
 });
 
 test("建议子仓库拼接跟随当前路径的分隔符，且拒绝静默变成根目录", () => {
-  assert.equal(joinWorkspacePath("E:\\ai-open-resource", "rea"), "E:\\ai-open-resource\\rea");
-  assert.equal(joinWorkspacePath("E:/ai-open-resource/", "rea"), "E:/ai-open-resource/rea");
+  assert.equal(joinWorkspacePath("E:\\example-project", "module"), "E:\\example-project\\module");
+  assert.equal(joinWorkspacePath("E:/example-project/", "module"), "E:/example-project/module");
   assert.equal(joinWorkspacePath("E:\\a", "sub/dir"), "E:\\a\\sub\\dir");
   // 空建议不切换（返回项目根本身，调用方据此判断不启用按钮）。
   assert.equal(joinWorkspacePath("E:\\a", ""), "E:\\a");

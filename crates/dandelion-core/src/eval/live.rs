@@ -46,7 +46,7 @@ pub fn live_enabled_from(raw: Option<&str>) -> bool {
     matches!(raw, Some("1") | Some("true"))
 }
 
-pub const DEFAULT_BASE_URL: &str = "http://192.168.183.25:9911/v1";
+pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 pub const DEFAULT_MODEL: &str = "Qwen3.8-Flash-Next";
 
 /// CLI/env/flag resolution for the endpoint under test. Flag wins, then env,
