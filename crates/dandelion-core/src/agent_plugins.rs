@@ -484,7 +484,9 @@ impl PiProcess {
                 answer.push_str(delta);
                 on_text(delta);
             }
-            if event["type"] == "agent_settled" {
+            // Current Pi RPC ends a prompt with agent_end; older releases used
+            // agent_settled. Accept both so a completed reply never hangs.
+            if event["type"] == "agent_end" || event["type"] == "agent_settled" {
                 if event["aborted"] == true { return Err(Error::Cancelled); }
                 settled = true;
             }
@@ -537,7 +539,11 @@ impl OpenCodeProcess {
         let mut command = external_command(&config, Engine::OpenCode)?;
         command.args(["serve", "--hostname", "127.0.0.1", "--port", &port.to_string()]);
         command.env("OPENCODE_SERVER_PASSWORD", &password);
-        let mut child = command.spawn().map_err(|err| Error::NotConfigured(format!("OpenCode 启动失败：{err}")))?;
+        // 走到这里说明程序已选定；spawn 失败是“程序启动失败”，不是
+        // “模型未配置”，不得归入 NotConfigured。
+        let mut child = command
+            .spawn()
+            .map_err(|err| Error::Provider(format!("OpenCode 程序启动失败：{err}")))?;
         let pid = child.id();
         let stderr_task = stderr_tail(child.stderr.take().ok_or_else(|| Error::Provider("OpenCode stderr unavailable".into()))?);
         // The serve process has no stdin/stdout protocol; drain output so it
@@ -714,12 +720,128 @@ fn discover_executable(name: &str, workspaces: &[PathBuf]) -> Option<PathBuf> {
 }
 
 fn resolved_executable(engine: Engine, config: &PluginConfig, workspaces: &[PathBuf]) -> Option<PathBuf> {
-    config
+    let found = config
         .executable
         .as_ref()
         .filter(|path| path.is_file())
         .cloned()
-        .or_else(|| discover_executable(engine.binary(), workspaces))
+        .or_else(|| discover_executable(engine.binary(), workspaces));
+    // 展示用尽力替换：解析得到原生 exe 就展示原生路径，解析不到仍展示
+    // 原路径（就绪状态不因此翻转，运行时的硬性检查在 executable()）。
+    #[cfg(windows)]
+    if engine == Engine::OpenCode {
+        if let Some(path) = &found {
+            if is_batch_launcher(path) {
+                if let Some(native) = native_batch_target(path) {
+                    return Some(native);
+                }
+            }
+        }
+    }
+    found
+}
+
+#[cfg(windows)]
+fn is_batch_launcher(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+}
+
+/// Windows：npm 生成的 `.cmd` 垫片实际由 cmd.exe 承载，cmd.exe 会把包含
+/// 换行、引号、前导 `-` 等特殊字符的位置参数以
+/// “batch file arguments are invalid” 直接拒掉，进程在 spawn 阶段就失败；
+/// 而 `opencode run` 恰恰必须把用户消息作为位置参数传入。因此 OpenCode
+/// 一旦落在批处理垫片上（托管安装或用户手动指定皆然），必须改为直接
+/// 启动垫片指向的原生 exe，绝不退回“用批处理传消息”。
+#[cfg(windows)]
+fn opencode_native_executable(path: PathBuf) -> Result<PathBuf> {
+    if !is_batch_launcher(&path) {
+        return Ok(path);
+    }
+    native_batch_target(&path).ok_or_else(|| Error::Provider(format!(
+        "OpenCode 程序启动失败：批处理启动器 {} 之后未找到可安全启动的原生 opencode.exe。\
+         npm 安装的 opencode-ai 自带原生可执行文件；若这是你手动指定的程序路径，请改为直接指向 opencode.exe。",
+        path.display()
+    )))
+}
+
+/// npm/yarn 风格批处理垫片真正执行的原生 exe：先按垫片文本里写的
+/// `.exe` 路径（`%dp0%`/`%~dp0%` 展开为垫片所在目录）精确跟随，再回退到
+/// opencode-ai 官方包的常见布局。
+#[cfg(windows)]
+fn native_batch_target(shim: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(shim).ok()?;
+    let dir = shim.parent()?;
+    let lower = text.to_lowercase();
+    let mut cursor = 0usize;
+    while let Some(found) = lower[cursor..].find(".exe") {
+        let end = cursor + found + 4;
+        cursor = end;
+        let start = lower[..end].rfind(['"', '\'', ' ', '\t']).map_or(0, |i| i + 1);
+        let token = text[start..end].trim();
+        if token.is_empty() {
+            continue;
+        }
+        let expanded = expand_batch_vars(token, dir);
+        if expanded.contains('%') || expanded.contains('$') {
+            continue;
+        }
+        let candidate = PathBuf::from(&expanded);
+        let candidate = if candidate.is_absolute() { candidate } else { dir.join(candidate) };
+        if candidate.is_file() {
+            return Some(native_path(candidate));
+        }
+    }
+    let stem = shim.file_stem()?.to_string_lossy().into_owned();
+    let node_modules = dir.parent()?;
+    for candidate in [
+        dir.join(format!("{stem}.exe")),
+        node_modules.join(format!("{stem}-ai")).join("bin").join(format!("{stem}.exe")),
+        node_modules.join(&stem).join("bin").join(format!("{stem}.exe")),
+        node_modules.join(format!("{stem}-windows-x64")).join("bin").join(format!("{stem}.exe")),
+    ] {
+        if candidate.is_file() {
+            return Some(native_path(candidate));
+        }
+    }
+    None
+}
+
+/// 塌掉 `%dp0%\..` 这类未归一化的中间组件，展示与报错都拿到干净路径。
+#[cfg(windows)]
+fn native_path(candidate: PathBuf) -> PathBuf {
+    dunce::canonicalize(&candidate).unwrap_or(candidate)
+}
+
+#[cfg(windows)]
+fn expand_batch_vars(token: &str, dir: &Path) -> String {
+    let dir = dir.to_string_lossy().into_owned();
+    let mut out = token.to_string();
+    // `%~dp0` 展开自带尾随反斜杠，`%dp0%`（垫片自设变量）没有。
+    for (var, value) in [
+        ("%~dp0%", &format!("{dir}\\")),
+        ("%~dp0", &format!("{dir}\\")),
+        ("%dp0%", &dir),
+        ("%dp0", &dir),
+    ] {
+        out = replace_case_insensitive(&out, var, value);
+    }
+    out
+}
+
+#[cfg(windows)]
+fn replace_case_insensitive(hay: &str, needle: &str, with: &str) -> String {
+    let lower = hay.to_lowercase();
+    let needle = needle.to_lowercase();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while let Some(pos) = lower[i..].find(&needle) {
+        out.push_str(&hay[i..i + pos]);
+        out.push_str(with);
+        i += pos + needle.len();
+    }
+    out.push_str(&hay[i..]);
+    out
 }
 
 pub fn list(data_dir: &Path, workspaces: &[PathBuf]) -> Result<Vec<PluginInfo>> {
@@ -775,8 +897,17 @@ pub fn executable(data_dir: &Path, engine: Engine, workspaces: &[PathBuf]) -> Re
     if explicit.is_some_and(|item| !item.enabled) {
         return Err(Error::NotConfigured(format!("{} plugin not installed", engine.id())));
     }
-    resolved_executable(engine, &config, workspaces)
-        .ok_or_else(|| Error::NotConfigured(format!("{} executable not found", engine.id())))
+    let path = resolved_executable(engine, &config, workspaces)
+        .ok_or_else(|| Error::NotConfigured(format!("{} executable not found", engine.id())))?;
+    // 运行时硬闸门（resolved_executable 只做尽力替换）：OpenCode 绝不能以
+    // 批处理垫片身份进入 spawn —— cmd.exe 会拒收含特殊字符的位置参数消息。
+    // 解析不到原生 exe 时给出明确错误，而不是带着垫片去撞
+    // “batch file arguments are invalid”。
+    #[cfg(windows)]
+    if engine == Engine::OpenCode {
+        return opencode_native_executable(path);
+    }
+    Ok(path)
 }
 
 pub fn is_managed(data_dir: &Path, engine: Engine) -> Result<bool> {
@@ -1044,7 +1175,11 @@ async fn execute_with_connection(
     for key in provider_keys {
         if let Some(value) = std::env::var_os(key) { command.env(key, value); }
     }
-    command.current_dir(cwd).stdin(std::process::Stdio::piped())
+    command.current_dir(cwd).stdin(if engine == Engine::OpenCode {
+        std::process::Stdio::null()
+    } else {
+        std::process::Stdio::piped()
+    })
         .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     hide_console_windows(&mut command);
@@ -1074,6 +1209,10 @@ async fn execute_with_connection(
             }
             if permission_mode == PermissionMode::Auto { command.arg("--auto"); }
             if permission_mode == PermissionMode::Deny { command.args(["--agent", "plan", "--pure"]); }
+            // `opencode run` takes the message as a positional argument. Its
+            // current CLI ignores a prompt written only to stdin and exits 0
+            // without a text event. `--` also protects prompts starting `-`.
+            command.args(["--", prompt]);
         }
         Engine::ClaudeCode => {
             command.args(["--print", "--verbose", "--output-format", "stream-json", "--include-partial-messages"]);
@@ -1085,16 +1224,24 @@ async fn execute_with_connection(
         }
     }
     if let Some(model) = model { command.args(["--model", model]); }
-    let mut child = command.spawn().map_err(|err| Error::NotConfigured(format!("{} 启动失败：{err}", engine.id())))?;
+    // 同上：可执行文件已解析成功，spawn 失败属于运行期启动故障
+    // （Provider），与“模型未配置”（NotConfigured）严格区分。
+    let mut child = command
+        .spawn()
+        .map_err(|err| Error::Provider(format!("{} 程序启动失败：{err}", engine.id())))?;
     let pid = child.id();
     #[cfg(unix)]
     let _group_guard = ProcessGroupGuard(pid);
-    let mut stdin = child.stdin.take().ok_or_else(|| Error::Provider("Agent stdin unavailable".into()))?;
-    let input = prompt.as_bytes().to_vec();
-    let stdin_task = tokio::spawn(async move {
-        stdin.write_all(&input).await?;
-        stdin.shutdown().await
-    });
+    let stdin_task = if engine == Engine::OpenCode {
+        None
+    } else {
+        let mut stdin = child.stdin.take().ok_or_else(|| Error::Provider("Agent stdin unavailable".into()))?;
+        let input = prompt.as_bytes().to_vec();
+        Some(tokio::spawn(async move {
+            stdin.write_all(&input).await?;
+            stdin.shutdown().await
+        }))
+    };
     let stdout = child.stdout.take().ok_or_else(|| Error::Provider("Agent stdout unavailable".into()))?;
     let stderr = child.stderr.take().ok_or_else(|| Error::Provider("Agent stderr unavailable".into()))?;
     let stderr_task = tokio::spawn(async move {
@@ -1167,7 +1314,9 @@ async fn execute_with_connection(
         };
         return Err(Error::Provider(format!("{} 退出：{detail}", engine.id())));
     }
-    stdin_task.await.map_err(|err| Error::Provider(format!("Agent input task failed: {err}")))??;
+    if let Some(stdin_task) = stdin_task {
+        stdin_task.await.map_err(|err| Error::Provider(format!("Agent input task failed: {err}")))??;
+    }
     if answer.trim().is_empty() {
         return Err(Error::Provider(format!("{} 未返回可见回答：{}", engine.id(), errors.trim())));
     }
@@ -1812,7 +1961,7 @@ mod tests {
     async fn pi_rpc_reuses_process_and_context_across_turns() {
         let dir = tempfile::tempdir().unwrap();
         let cli = dir.path().join("fake-pi.cmd");
-        std::fs::write(&cli, "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset count=0\r\n:next\r\nset /p line=\r\nif errorlevel 1 goto done\r\nset /a count+=1 >nul\r\necho {\"id\":\"dandelion-prompt\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true,\"data\":{\"disposition\":\"started\"}}\r\necho {\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"turn-!count!\"}}\r\necho {\"type\":\"agent_settled\",\"aborted\":false}\r\ngoto next\r\n:done\r\n").unwrap();
+        std::fs::write(&cli, "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset count=0\r\n:next\r\nset /p line=\r\nif errorlevel 1 goto done\r\nset /a count+=1 >nul\r\necho {\"id\":\"dandelion-prompt\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\r\necho {\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"turn-!count!\"}}\r\necho {\"type\":\"agent_end\"}\r\ngoto next\r\n:done\r\n").unwrap();
         let sessions = AgentSessions::default();
         for (prompt, expected) in [("first", "turn-1"), ("second", "turn-2")] {
             let answer = sessions.execute(Engine::Pi, "conversation", &cli, None,
@@ -1849,7 +1998,7 @@ mod tests {
     async fn opencode_attach_tracks_native_session_id() {
         let dir = tempfile::tempdir().unwrap();
         let cli = dir.path().join("fake-opencode.cmd");
-        std::fs::write(&cli, "@echo off\r\necho %* >\"%~dp0args.txt\"\r\nset /p line=\r\necho {\"type\":\"text\",\"sessionID\":\"native-123\",\"part\":{\"text\":\"ok\"}}\r\n").unwrap();
+        std::fs::write(&cli, "@echo off\r\necho %* >\"%~dp0args.txt\"\r\necho {\"type\":\"text\",\"sessionID\":\"native-123\",\"part\":{\"text\":\"ok\"}}\r\n").unwrap();
         let mut observed = None;
         let answer = execute_with_connection(Engine::OpenCode, &cli, None, dir.path(),
             "hello", &[], PermissionMode::Auto, CancellationToken::new(),
@@ -1861,6 +2010,122 @@ mod tests {
         let args = std::fs::read_to_string(dir.path().join("args.txt")).unwrap();
         assert!(args.contains("--attach http://127.0.0.1:1234"));
         assert!(args.contains("--session native-previous"));
+        assert!(args.contains("-- hello"), "OpenCode prompt must be positional: {args}");
+    }
+
+    /// 与托管安装同形的真实 npm 布局：`.bin\opencode.cmd` 使用 npm 实际
+    /// 生成的垫片文本，原生 exe 位置放现场编译的探针（它会记录收到的
+    /// argv 并按 OpenCode 协议回显消息，不是回显固定答案的假 `.cmd`）。
+    #[cfg(windows)]
+    const NPM_SHIM: &str = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\..\\opencode-ai\\bin\\opencode.exe\"   %*\r\n";
+
+    /// 把探针编译成 npm 布局里的原生 opencode.exe，返回 (shim, exe)。
+    #[cfg(windows)]
+    fn opencode_npm_layout(dir: &Path) -> (PathBuf, PathBuf) {
+        let bin = dir.join("node_modules").join(".bin");
+        let native_dir = dir.join("node_modules").join("opencode-ai").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&native_dir).unwrap();
+        let shim = bin.join("opencode.cmd");
+        std::fs::write(&shim, NPM_SHIM).unwrap();
+        let exe = native_dir.join("opencode.exe");
+        let source = native_dir.join("opencode_probe.rs");
+        std::fs::write(&source, include_str!("../tests/fixtures/win_opencode_probe.rs")).unwrap();
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let built = std::process::Command::new(rustc)
+            .args(["--edition", "2021", "--crate-name", "dln_opencode_probe"])
+            .arg("-o").arg(&exe).arg(&source)
+            .output()
+            .expect("rustc 可用");
+        assert!(built.status.success(), "OpenCode 探针编译失败：{}", String::from_utf8_lossy(&built.stderr));
+        (shim, exe)
+    }
+
+    /// 选择逻辑：无论路径来自蒲公英托管安装还是用户手动指定（两者都
+    /// 经 config.executable → executable()），OpenCode 都必须落在原生
+    /// exe 上；直接指向 exe 时原样通过；垫片背后找不到原生 exe 时给出
+    /// 明确的“程序启动失败”错误，绝不把消息交给批处理垫片。
+    #[cfg(windows)]
+    #[test]
+    fn opencode_resolves_native_exe_not_the_batch_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shim, exe) = opencode_npm_layout(dir.path());
+
+        let registry_of = |path: PathBuf, managed: bool| {
+            let mut registry = Registry::default();
+            registry.plugins.insert("opencode".into(), PluginConfig {
+                enabled: true, executable: Some(path), managed, model: None,
+            });
+            write_registry(dir.path(), &registry).unwrap();
+        };
+
+        let same_file = |a: &Path, b: &Path| dunce::canonicalize(a).unwrap() == dunce::canonicalize(b).unwrap();
+
+        // 托管安装（agent-engines 下 .bin\opencode.cmd 的同一形态）。
+        registry_of(shim.clone(), true);
+        let chosen = executable(dir.path(), Engine::OpenCode, &[]).unwrap();
+        assert!(same_file(&chosen, &exe), "托管 shim 必须被解析为原生 opencode.exe，实际 {chosen:?}");
+        assert!(!is_batch_launcher(&chosen));
+
+        // 用户手动指定原生 exe：原样直通，不做任何改写。
+        registry_of(exe.clone(), false);
+        assert_eq!(executable(dir.path(), Engine::OpenCode, &[]).unwrap(), exe);
+
+        // 手动指定 .cmd 且背后确有原生 exe：同样换到原生 exe。
+        registry_of(shim.clone(), false);
+        assert!(same_file(&executable(dir.path(), Engine::OpenCode, &[]).unwrap(), &exe));
+
+        // 垫片背后无原生 exe：明确报程序启动失败并告知原因；
+        // 不得伪装成 not configured，也不得放行 .cmd。
+        let ghost_dir = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&ghost_dir).unwrap();
+        let ghost = ghost_dir.join("opencode.cmd");
+        std::fs::write(&ghost, "@ECHO off\r\n\"%dp0%\\missing\\opencode.exe\" %*\r\n").unwrap();
+        registry_of(ghost, true);
+        let err = executable(dir.path(), Engine::OpenCode, &[]).expect_err("无原生 exe 的垫片必须被拒绝");
+        let text = err.to_string();
+        assert!(matches!(err, Error::Provider(_)), "应为运行期启动故障而非配置缺失：{text}");
+        assert!(text.contains("opencode.exe") && text.contains("启动失败"), "错误必须指明可执行的补救方向：{text}");
+        assert!(!text.starts_with("not configured"), "不得再出现误导性配置缺失文案：{text}");
+    }
+
+    /// 端到端消息传递：以 executable() 实际选中的原生 exe 运行
+    /// `execute_with_connection`，核验中文、引号、换行、前导 `-` 四类
+    /// 消息逐字到达被选中的程序（探针回写的 argv 文件），并且 `--`
+    /// 分隔在场；探针按协议回显的 answer 必须与 prompt 逐字相等。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn opencode_run_delivers_prompts_via_native_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shim, exe) = opencode_npm_layout(dir.path());
+        let mut registry = Registry::default();
+        registry.plugins.insert("opencode".into(), PluginConfig {
+            enabled: true, executable: Some(shim), managed: true, model: None,
+        });
+        write_registry(dir.path(), &registry).unwrap();
+        let chosen = executable(dir.path(), Engine::OpenCode, &[]).unwrap();
+        assert!(dunce::canonicalize(&chosen).unwrap() == dunce::canonicalize(&exe).unwrap());
+        let args_file = exe.parent().unwrap().join("last_args.txt");
+
+        for prompt in [
+            "你好",
+            "say \"hi\" and 'go' now",
+            "-dash-leading message",
+            "line one\nline two\nend",
+        ] {
+            let answer = execute_with_connection(Engine::OpenCode, &chosen, None, dir.path(),
+                prompt, &[], PermissionMode::Auto, CancellationToken::new(), None,
+                |_| {}, |_| {}).await
+                .unwrap_or_else(|err| panic!("prompt {prompt:?} 应成功送达原生 exe：{err}"));
+            assert_eq!(answer, prompt, "消息必须经原生 exe 原样往返");
+            let recorded = std::fs::read_to_string(&args_file).expect("探针应已启动并记录 argv");
+            let argv: Vec<&str> = recorded.split('\u{1f}').collect();
+            for flag in ["run", "--format", "json", "--auto"] {
+                assert!(argv.contains(&flag), "缺少 run 参数 {flag}：{argv:?}");
+            }
+            let dash = argv.iter().rposition(|a| *a == "--").expect("`--` 分隔必须在场");
+            assert_eq!(argv[dash + 1], prompt, "消息必须逐字作为 `--` 后的位置参数：{argv:?}");
+        }
     }
 
     #[cfg(windows)]
