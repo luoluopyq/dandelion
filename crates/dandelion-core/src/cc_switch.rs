@@ -67,6 +67,9 @@ pub fn claude_dir(data_dir: &Path) -> PathBuf {
 fn command(data_dir: &Path) -> Command {
     let mut cmd = Command::new(binary(data_dir));
     apply_env(&mut cmd, data_dir);
+    // 静默托管的辅助 CLI（--version 探测、provider 切换）：GUI 宿主下不得
+    // 弹出控制台窗口，见 agent_plugins::hide_console_windows。
+    crate::agent_plugins::hide_console_windows(&mut cmd);
     cmd
 }
 
@@ -143,8 +146,8 @@ pub async fn install(
     std::fs::create_dir_all(parent)?;
     let archive = parent.join(&file_name);
     std::fs::write(&archive, bytes)?;
-    let output = Command::new("tar")
-        .arg("-xf")
+    let mut untar = Command::new("tar");
+    untar.arg("-xf")
         .arg(&archive)
         .arg("-C")
         .arg(parent)
@@ -153,9 +156,9 @@ pub async fn install(
         } else {
             "cc-switch"
         })
-        .kill_on_drop(true)
-        .output()
-        .await;
+        .kill_on_drop(true);
+    crate::agent_plugins::hide_console_windows(&mut untar);
+    let output = untar.output().await;
     let _ = std::fs::remove_file(&archive);
     let output = output.map_err(|e| Error::Provider(format!("解压 CC Switch CLI 失败：{e}")))?;
     if !output.status.success() || !target.is_file() {

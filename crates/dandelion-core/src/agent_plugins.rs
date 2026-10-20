@@ -341,6 +341,40 @@ impl ClaudeSessions {
     }
 }
 
+/// Windows：凡是被我们静默托管（stdio 全部走管道、由 harness 消化输出）的
+/// 子进程都必须设置 CREATE_NO_WINDOW。桌面宿主是 GUI 进程（无控制台），而
+/// 引擎 CLI 都是控制台子系统程序（claude.exe PE Subsystem=3；npm.cmd 经
+/// cmd.exe；taskkill 同），不设置标志时 CreateProcess 会为每个子进程新分配
+/// 一个黑色控制台窗口 —— 这就是安装版使用 Claude Code 时弹出 "claude"
+/// 窗口的原因，Pi / OpenCode / 安装与清理辅助进程同理。
+/// 选 CREATE_NO_WINDOW 而非 DETACHED_PROCESS：后者让孩子完全无控制台，它
+/// 再派生的控制台孙进程（git/rg/sh 等）会各自闪现新窗口；前者让孩子持有一个
+/// 无窗口的控制台，孙进程继承之，整棵进程树无弹窗。与 Hermes
+/// `_subprocess_compat.windows_detach_flags`、Codex windows-sandbox 同一
+/// 策略，也与本仓库 jobs.rs / sidecar.rs 的既有写法一致。
+/// 注意：本函数只用于静默托管的子进程；用户主动打开的窗口不走这里。
+pub(crate) fn hide_console_windows(command: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
+/// std::process::Command 版本的 [`hide_console_windows`]。
+pub(crate) fn hide_console_windows_std(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 fn external_command(config: &ProcessConfig, engine: Engine) -> Result<tokio::process::Command> {
     let mut command = tokio::process::Command::new(&config.executable);
     command.env_clear();
@@ -358,6 +392,7 @@ fn external_command(config: &ProcessConfig, engine: Engine) -> Result<tokio::pro
     command.current_dir(&config.cwd).stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    hide_console_windows(&mut command);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -810,6 +845,7 @@ pub async fn install_managed_with_progress(
     if engine == Engine::Pi { install.arg("--ignore-scripts"); }
     install.arg(engine.package()).kill_on_drop(true)
         .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    hide_console_windows(&mut install);
     #[cfg(unix)] {
         use std::os::unix::process::CommandExt;
         install.as_std_mut().process_group(0);
@@ -1011,6 +1047,7 @@ async fn execute_with_connection(
     command.current_dir(cwd).stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    hide_console_windows(&mut command);
     command.envs(env.iter().map(|(key, value)| (key, value)));
     if engine == Engine::OpenCode && permission_mode == PermissionMode::Deny {
         command.env("OPENCODE_CONFIG_CONTENT", restricted_opencode_config(env)?);
@@ -1315,6 +1352,7 @@ fn spawn_claude_process(config: ClaudeProcessConfig) -> Result<ClaudeProcess> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    hide_console_windows(&mut command);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1611,9 +1649,10 @@ async fn kill_process_tree(pid: Option<u32>, child: &mut tokio::process::Child) 
     }
     #[cfg(windows)]
     if let Some(pid) = pid {
-        let _ = tokio::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output().await;
+        let mut kill = tokio::process::Command::new("taskkill");
+        kill.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        hide_console_windows(&mut kill);
+        let _ = kill.output().await;
     }
     let _ = child.kill().await;
     let _ = child.wait().await;
@@ -1634,6 +1673,64 @@ impl Drop for ProcessGroupGuard {
 
 #[cfg(test)]
 mod tests {
+    /// 生产段（`#[cfg(test)]` 之前）里每个外部子进程构造后都必须调用
+    /// hide_console_windows(_std)。日后新增 spawn 漏配时本测试必须红 ——
+    /// 静默托管的子进程不允许有漏网的；GUI 宿主下漏一个就多一种弹窗。
+    #[test]
+    fn every_spawn_site_in_agent_plugins_hides_its_console() {
+        let source = include_str!("agent_plugins.rs");
+        let production = source.split("#[cfg(test)]").next().expect("tests marker");
+        let mut remaining = production;
+        let mut sites = 0usize;
+        while let Some(at) = remaining.find("Command::new(") {
+            let after = &remaining[at + "Command::new(".len()..];
+            let next_site = after.find("Command::new(").unwrap_or(after.len());
+            let span = &after[..next_site];
+            assert!(
+                span.contains("hide_console_windows"),
+                "agent_plugins.rs 中一处子进程构造缺少 hide_console_windows：{})",
+                span.chars().take(160).collect::<String>(),
+            );
+            sites += 1;
+            remaining = &after[next_site..];
+        }
+        assert!(sites >= 5, "子进程 spawn 点数量与审计预期不符：{sites}");
+    }
+
+    /// 行为验证：在 GUI 宿主同形（父进程无控制台）的真实场景下，
+    /// CREATE_NO_WINDOW 让被管道托管的控制台子进程不再获得带窗口的控制台。
+    /// 探针源码见 tests/fixtures/win_no_console_probe.rs。
+    /// （对照组不带标志时，交互式桌面上会短暂闪出一个 powershell 控制台窗口
+    /// —— 那正是被修复的缺陷本身；无窗口站的会话中对照组结果仅供参考。）
+    #[cfg(windows)]
+    #[test]
+    fn hosted_children_get_no_console_window() {
+        let dir = std::env::temp_dir().join(format!("dln-no-console-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp probe dir");
+        let source = dir.join("win_no_console_probe.rs");
+        let exe = dir.join("win_no_console_probe.exe");
+        std::fs::write(&source, include_str!("../tests/fixtures/win_no_console_probe.rs"))
+            .expect("write probe source");
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let built = std::process::Command::new(rustc)
+            .args(["--edition", "2021", "--crate-name", "dln_no_console_probe"])
+            .arg("-o").arg(&exe).arg(&source)
+            .output()
+            .expect("rustc 可用");
+        assert!(built.status.success(), "探针编译失败：{}", String::from_utf8_lossy(&built.stderr));
+        let run = |mode: &str| -> String {
+            let out = std::process::Command::new(&exe).arg(mode).output().expect("探针可运行");
+            assert!(out.status.success(), "探针 {mode} 运行失败：{}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).split('|').next().unwrap_or("").trim().to_string()
+        };
+        assert_eq!(run("hide").as_str(), "0", "CREATE_NO_WINDOW 下的子进程不应持有带窗口的控制台");
+        let shown = run("show");
+        if shown == "0" {
+            eprintln!("提示：当前会话无法为对照组分配可见控制台（无窗口站？），负向对照仅记录不判定");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn claude_content_wraps_only_valid_images_as_blocks() {
         // 无图：纯字符串，与旧行为逐字节一致。

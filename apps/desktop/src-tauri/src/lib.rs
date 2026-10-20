@@ -970,11 +970,27 @@ fn read_folder_file(root: &str, relative_path: &str) -> Result<FilePreview, Stri
     })
 }
 
+/// 桌面宿主是 GUI 进程（无控制台），git.exe 是控制台子系统程序：不设
+/// CREATE_NO_WINDOW 时每次 git 辅助调用（状态刷新、diff、版本探测）都会在
+/// Windows 上闪出一个黑色控制台窗口。与 dandelion-core 的
+/// agent_plugins::hide_console_windows 同一策略 —— 凡 stdio 被我们捕获的
+/// 子进程一律无窗托管。
+fn git_command() -> ProcessCommand {
+    let mut command = ProcessCommand::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 fn read_workspace_review(root: &str) -> Result<ReviewSnapshot, String> {
     let root = PathBuf::from(root)
         .canonicalize()
         .map_err(|e| e.to_string())?;
-    let output = ProcessCommand::new("git")
+    let output = git_command()
         .args([
             "-C",
             &root.to_string_lossy(),
@@ -1025,7 +1041,7 @@ fn git_root(root: &str) -> Result<PathBuf, String> {
 
 fn run_git(root: &str, args: &[&str]) -> Result<String, String> {
     let root = git_root(root)?;
-    let output = ProcessCommand::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(&root)
         .args(args)
@@ -1078,7 +1094,7 @@ fn read_git_snapshot(root: &str) -> Result<GitSnapshot, String> {
         .to_string()
         .trim_start_matches(r"\\?\")
         .to_string();
-    let version = ProcessCommand::new("git").arg("--version").output();
+    let version = git_command().arg("--version").output();
     let Ok(version) = version else {
         return Ok(GitSnapshot {
             root,
@@ -1247,7 +1263,7 @@ fn read_git_diff(root: &str, path: Option<&str>, staged: bool) -> Result<String,
     let root_path = git_root(root)?;
     let safe_path = path.map(safe_git_path).transpose()?;
     if let Some(path) = safe_path.as_deref() {
-        let tracked = ProcessCommand::new("git")
+        let tracked = git_command()
             .arg("-C")
             .arg(&root_path)
             .args(["ls-files", "--error-unmatch", "--", path])
@@ -1270,7 +1286,7 @@ fn read_git_diff(root: &str, path: Option<&str>, staged: bool) -> Result<String,
             return Ok(format!("diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{} @@\n{body}", text.lines().count()));
         }
     }
-    let mut command = ProcessCommand::new("git");
+    let mut command = git_command();
     command
         .arg("-C")
         .arg(root_path)

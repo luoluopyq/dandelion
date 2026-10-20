@@ -1397,13 +1397,13 @@ pub fn probe_hardware(disk_path: &Path) -> HardwareProbe {
 }
 
 fn nvidia_smi() -> Option<(String, u64)> {
-    let out = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=name,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .ok()?;
+    let mut probe = std::process::Command::new("nvidia-smi");
+    probe.args([
+        "--query-gpu=name,memory.total",
+        "--format=csv,noheader,nounits",
+    ]);
+    crate::agent_plugins::hide_console_windows_std(&mut probe);
+    let out = probe.output().ok()?;
     if !out.status.success() {
         return None;
     }

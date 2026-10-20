@@ -445,6 +445,9 @@ async fn connect_stdio(
     // credentials are supplied only for the process lifetime, but inherited
     // stderr would bypass Dandelion's redaction boundary.
     cmd.stderr(std::process::Stdio::null());
+    // stdio MCP 服务器同样是被静默托管的控制台子进程（npx/node 等），
+    // Windows GUI 宿主下不得弹出控制台窗口。
+    crate::agent_plugins::hide_console_windows(&mut cmd);
     #[cfg(unix)]
     {
         cmd.process_group(0);

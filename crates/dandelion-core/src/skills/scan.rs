@@ -280,9 +280,12 @@ pub fn skill_md_path<'a>(docs: &'a [SkillDoc], id: &str) -> Result<&'a Path> {
 pub fn open_path_in_os(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", &path.to_string_lossy()])
-            .spawn()
+        // 打开资源管理器是本函数唯一的可见效果；承载 `start` 的 cmd 本身
+        // 必须无窗运行，否则 GUI 宿主下每次都会闪一个黑色 cmd 窗口。
+        let mut open = std::process::Command::new("cmd");
+        open.args(["/c", "start", "", &path.to_string_lossy()]);
+        crate::agent_plugins::hide_console_windows_std(&mut open);
+        open.spawn()
             .map_err(|err| Error::Invalid(format!("open {}: {err}", path.display())))?;
         Ok(())
     }
