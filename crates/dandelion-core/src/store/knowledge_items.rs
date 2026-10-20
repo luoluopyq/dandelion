@@ -507,10 +507,16 @@ impl Store {
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
         let existing = self.item_by_source(subject, &source)?;
         if let Some(old) = &existing {
+            // `knowledge_item_asset` 返回 canonicalize 后的路径；Windows 上它会带
+            // `\\?\` 扩展长度前缀，而 `snapshot` 是裸 join 拼写 —— 直接比永远不等，
+            // Windows 上重复导入同一文件会一直长重复版本。两边化到同一拼写再比。
+            // snapshot 到这一步必然已落盘（上面 rename/删 temp 分支保证）。
+            let snapshot_canon = snapshot.canonicalize().ok();
             if matches!(old.parse_status.as_str(), "ready" | "empty" | "unsupported")
-                && self
-                    .knowledge_item_asset(subject, &old.id)
-                    .is_ok_and(|p| p == snapshot)
+                && snapshot_canon.as_ref().is_some_and(|sc| {
+                    self.knowledge_item_asset(subject, &old.id)
+                        .is_ok_and(|p| &p == sc)
+                })
             {
                 return Ok(old.clone());
             }
