@@ -3159,7 +3159,7 @@ impl Runtime {
             };
             let outcome = self.inner.agent_sessions.execute(
                 engine, &session_id_str, &executable, model.as_deref(), &workspace,
-                text, &prompt, &env, permission_mode, settings.http_connect_timeout_ms,
+                text, &prompt, &env, permission_mode,
                 &claude_extra_dirs, Some(&approval), claude_images,
                 wiki_bridge_file.as_deref(),
                 cancel.clone(), &mut on_text, &mut on_tool,

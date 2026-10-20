@@ -144,16 +144,14 @@ struct PiProcess {
     _group_guard: ProcessGroupGuard,
 }
 
-struct OpenCodeProcess {
+/// OpenCode 的每轮直启状态。历史上这里常驻一个 `serve` 进程、每轮
+/// `run --attach` 连上去；真机证实（v1.18.35 与 v1.19.3 均复现）attach
+/// 客户端只转发 step_start 就退出，文本与工具事件全被吞掉（服务端会话
+/// API 里回答其实已生成）。现改为每轮直接 `run --session <id>`，run 自起
+/// 自退，因此只需记住上轮配置（一致才敢续接）与 OpenCode 原生会话 ID。
+struct OpenCodeTurnState {
     config: ProcessConfig,
-    child: Child,
-    pid: Option<u32>,
-    url: String,
-    password: String,
     native_session: Option<String>,
-    stderr_task: tokio::task::JoinHandle<String>,
-    #[cfg(unix)]
-    _group_guard: ProcessGroupGuard,
 }
 
 /// A conversation owns one external Agent session. The transport varies by
@@ -162,7 +160,7 @@ struct OpenCodeProcess {
 pub struct AgentSessions {
     claude: ClaudeSessions,
     pi: Mutex<HashMap<String, Arc<tokio::sync::Mutex<PiProcess>>>>,
-    opencode: Mutex<HashMap<String, Arc<tokio::sync::Mutex<OpenCodeProcess>>>>,
+    opencode: Mutex<HashMap<String, Arc<tokio::sync::Mutex<OpenCodeTurnState>>>>,
 }
 
 impl AgentSessions {
@@ -195,12 +193,8 @@ impl AgentSessions {
                     .unwrap_or_default();
                 for process in processes { process.lock().await.kill().await; }
             }
-            Engine::OpenCode => {
-                let processes: Vec<_> = self.opencode.lock().ok()
-                    .map(|mut map| map.drain().map(|(_, process)| process).collect())
-                    .unwrap_or_default();
-                for process in processes { process.lock().await.kill().await; }
-            }
+            // run 逐轮自起自退，无常驻进程可杀；清掉续接凭据即可。
+            Engine::OpenCode => { if let Ok(mut map) = self.opencode.lock() { map.clear(); } }
             Engine::Native => {}
         }
     }
@@ -225,13 +219,7 @@ impl AgentSessions {
                         }
                     }
                 }
-                Engine::OpenCode => {
-                    if let Some(process) = self.opencode.lock().ok().and_then(|mut map| map.remove(&id)) {
-                        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                            runtime.spawn(async move { process.lock().await.kill().await; });
-                        }
-                    }
-                }
+                Engine::OpenCode => { if let Ok(mut map) = self.opencode.lock() { map.remove(&id); } }
                 Engine::Native => {}
             }
         }
@@ -247,11 +235,7 @@ impl AgentSessions {
             }
         }
         if engine != Engine::OpenCode {
-            if let Some(process) = self.opencode.lock().ok().and_then(|mut map| map.remove(session_id)) {
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    runtime.spawn(async move { process.lock().await.kill().await; });
-                }
-            }
+            if let Ok(mut map) = self.opencode.lock() { map.remove(session_id); }
         }
     }
 
@@ -276,7 +260,7 @@ impl AgentSessions {
     pub async fn execute(
         &self, engine: Engine, session_id: &str, executable: &Path, model: Option<&str>,
         cwd: &Path, prompt: &str, fresh_prompt: &str, env: &[(String, String)],
-        permission_mode: PermissionMode, startup_timeout_ms: u64,
+        permission_mode: PermissionMode,
         claude_extra_dirs: &[PathBuf], claude_approval: Option<&ClaudeApproval<'_>>,
         claude_images: &[String], wiki_bridge_file: Option<&Path>,
         cancel: CancellationToken,
@@ -290,7 +274,7 @@ impl AgentSessions {
             Engine::Pi => self.execute_pi(session_id, executable, model, cwd, prompt,
                 fresh_prompt, env, permission_mode, wiki_bridge_file, cancel, &mut on_text, &mut on_tool).await,
             Engine::OpenCode => self.execute_opencode(session_id, executable, model, cwd, prompt,
-                fresh_prompt, env, permission_mode, startup_timeout_ms, cancel, &mut on_text, &mut on_tool).await,
+                fresh_prompt, env, permission_mode, cancel, &mut on_text, &mut on_tool).await,
             Engine::Native => Err(Error::Invalid("native engine has no CLI adapter".into())),
         }
     }
@@ -529,101 +513,16 @@ impl AgentSessions {
     }
 }
 
-impl OpenCodeProcess {
-    async fn spawn(config: ProcessConfig, startup_timeout_ms: u64, cancel: &CancellationToken) -> Result<Self> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        drop(listener);
-        let password = uuid::Uuid::new_v4().to_string();
-        let url = format!("http://127.0.0.1:{port}");
-        let mut command = external_command(&config, Engine::OpenCode)?;
-        command.args(["serve", "--hostname", "127.0.0.1", "--port", &port.to_string()]);
-        command.env("OPENCODE_SERVER_PASSWORD", &password);
-        // 走到这里说明程序已选定；spawn 失败是“程序启动失败”，不是
-        // “模型未配置”，不得归入 NotConfigured。
-        let mut child = command
-            .spawn()
-            .map_err(|err| Error::Provider(format!("OpenCode 程序启动失败：{err}")))?;
-        let pid = child.id();
-        let stderr_task = stderr_tail(child.stderr.take().ok_or_else(|| Error::Provider("OpenCode stderr unavailable".into()))?);
-        // The serve process has no stdin/stdout protocol; drain output so it
-        // cannot stall on a full pipe while a later turn is running.
-        if let Some(mut stdout) = child.stdout.take() {
-            tokio::spawn(async move { let mut sink = tokio::io::sink(); let _ = tokio::io::copy(&mut stdout, &mut sink).await; });
-        }
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(startup_timeout_ms.max(1)))
-            .build().map_err(|err| Error::Provider(err.to_string()))?;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(startup_timeout_ms.max(1));
-        loop {
-            if cancel.is_cancelled() {
-                kill_process_tree(pid, &mut child).await;
-                stderr_task.abort();
-                return Err(Error::Cancelled);
-            }
-            if let Some(status) = child.try_wait()? {
-                let details = stderr_task.await.unwrap_or_default();
-                return Err(Error::Provider(format!("OpenCode 服务退出（{status}）：{details}")));
-            }
-            let probe = client.get(format!("{url}/global/health"))
-                .basic_auth("opencode", Some(&password)).send();
-            let response = tokio::select! {
-                _ = cancel.cancelled() => {
-                    kill_process_tree(pid, &mut child).await;
-                    stderr_task.abort();
-                    return Err(Error::Cancelled);
-                }
-                response = probe => response,
-            };
-            if let Ok(response) = response {
-                if response.status().is_success() { break; }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                kill_process_tree(pid, &mut child).await;
-                stderr_task.abort();
-                return Err(Error::Provider("OpenCode 服务启动超时".into()));
-            }
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    kill_process_tree(pid, &mut child).await;
-                    stderr_task.abort();
-                    return Err(Error::Cancelled);
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-            }
-        }
-        Ok(Self { config, child, pid, url, password, native_session: None, stderr_task,
-            #[cfg(unix)] _group_guard: ProcessGroupGuard(pid) })
-    }
-
-    async fn kill(&mut self) {
-        kill_process_tree(self.pid, &mut self.child).await;
-        self.stderr_task.abort();
-    }
-
-    async fn turn(&mut self, prompt: &str, cancel: CancellationToken,
-        on_text: &mut impl FnMut(&str), on_tool: &mut impl FnMut(ExternalToolEvent)) -> Result<String> {
-        let mut observed_session = None;
-        let result = execute_with_connection(Engine::OpenCode, &self.config.executable,
-            self.config.model.as_deref(), &self.config.cwd, prompt, &self.config.env,
-            self.config.permission_mode, cancel,
-            Some(OpenCodeConnection { url: &self.url, password: &self.password,
-                native_session: self.native_session.as_deref(), observed_session: &mut observed_session }),
-            on_text, on_tool).await;
-        if result.is_ok() {
-            self.native_session = observed_session.or_else(|| self.native_session.take());
-            if self.native_session.is_none() {
-                return Err(Error::Provider("OpenCode 未提供会话 ID，无法安全续接".into()));
-            }
-        }
-        result
-    }
-}
-
 impl AgentSessions {
+    /// 每轮直启一次 `opencode run`（真机证据见 `OpenCodeTurnState` 注释：
+    /// serve+attach 形态会把回答整个吞掉）。会话续接靠回传 OpenCode 自己的
+    /// `--session <原生 ID>`——跨进程续接已实测正确（新一轮回想起上一轮
+    /// 内容）。与 Pi 同构：配置一致才续接；配置变了或本轮出错就删条目，
+    /// 下一轮自动回到 fresh_prompt 开新会话（开新/续接由调用方通过
+    /// fresh_prompt/prompt 区分）。
     async fn execute_opencode(&self, id: &str, executable: &Path, model: Option<&str>, cwd: &Path,
         prompt: &str, fresh_prompt: &str, env: &[(String, String)], permission_mode: PermissionMode,
-        startup_timeout_ms: u64, cancel: CancellationToken, on_text: &mut impl FnMut(&str),
+        cancel: CancellationToken, on_text: &mut impl FnMut(&str),
         on_tool: &mut impl FnMut(ExternalToolEvent)) -> Result<String> {
         // OpenCode gets the bridge through OPENCODE_CONFIG_CONTENT (merged
         // into its `mcp` key by the caller), so no extra file flag here.
@@ -631,24 +530,44 @@ impl AgentSessions {
             cwd: cwd.to_path_buf(), env: env.to_vec(), permission_mode, extra_dirs: Vec::new(),
             wiki_bridge_file: None };
         let existing = self.opencode.lock().map_err(|_| Error::Provider("OpenCode 会话锁已损坏".into()))?.get(id).cloned();
-        if let Some(process) = &existing {
-            let mut guard = process.lock().await;
-            if guard.config == config && guard.child.try_wait()?.is_none() {
-                let result = guard.turn(prompt, cancel, on_text, on_tool).await;
-                if result.is_err() { guard.kill().await; self.opencode.lock().unwrap().remove(id); }
-                return result;
+        if let Some(state) = &existing {
+            // 这把锁仍有用：串行化同一会话的两轮，防止同一原生会话被并发续接两次。
+            let mut guard = state.lock().await;
+            if guard.config == config && guard.native_session.is_some() {
+                let session = guard.native_session.clone();
+                let mut observed = None;
+                let result = execute_with_connection(Engine::OpenCode, &config.executable,
+                    config.model.as_deref(), &config.cwd, prompt, &config.env,
+                    config.permission_mode, cancel,
+                    Some(OpenCodeRun { session: session.as_deref(), observed_session: &mut observed }),
+                    on_text, on_tool).await;
+                let answer = match result {
+                    Ok(answer) => answer,
+                    Err(err) => { drop(guard); self.opencode.lock().unwrap().remove(id); return Err(err); }
+                };
+                // 本轮没观测到 sessionID 就保留旧值（与旧实现一致）。
+                if observed.is_some() { guard.native_session = observed; }
+                return Ok(answer);
             }
-            guard.kill().await;
+            drop(guard);
             self.opencode.lock().unwrap().remove(id);
         }
         if cancel.is_cancelled() { return Err(Error::Cancelled); }
-        let process = Arc::new(tokio::sync::Mutex::new(
-            OpenCodeProcess::spawn(config, startup_timeout_ms, &cancel).await?));
-        self.opencode.lock().map_err(|_| Error::Provider("OpenCode 会话锁已损坏".into()))?.insert(id.to_owned(), process.clone());
-        let mut guard = process.lock().await;
-        let result = guard.turn(fresh_prompt, cancel, on_text, on_tool).await;
-        if result.is_err() { guard.kill().await; self.opencode.lock().unwrap().remove(id); }
-        result
+        let mut observed = None;
+        let answer = execute_with_connection(Engine::OpenCode, &config.executable,
+            config.model.as_deref(), &config.cwd, fresh_prompt, &config.env,
+            config.permission_mode, cancel,
+            Some(OpenCodeRun { session: None, observed_session: &mut observed }),
+            on_text, on_tool).await?;
+        // 首轮成功却没拿到会话 ID：回答已交付，但没有可续接的凭据，
+        // 如实报错且不落条目（下一轮仍开新会话，不做半吊子续接）。
+        let native_session = match observed {
+            Some(session) => session,
+            None => return Err(Error::Provider("OpenCode 未提供会话 ID，无法安全续接".into())),
+        };
+        let state = Arc::new(tokio::sync::Mutex::new(OpenCodeTurnState { config, native_session: Some(native_session) }));
+        self.opencode.lock().map_err(|_| Error::Provider("OpenCode 会话锁已损坏".into()))?.insert(id.to_owned(), state);
+        Ok(answer)
     }
 }
 
@@ -1139,17 +1058,18 @@ pub async fn execute(
         cancel, None, &mut on_text, &mut on_tool).await
 }
 
-struct OpenCodeConnection<'a> {
-    url: &'a str,
-    password: &'a str,
-    native_session: Option<&'a str>,
+/// 单轮 OpenCode 直启 `run` 的会话参数：`session` 是上轮观测到的原生
+/// 会话 ID（None = 开新会话），`observed_session` 收本轮事件里的
+/// sessionID，成功轮由 `execute_opencode` 回写状态供下轮续接。
+struct OpenCodeRun<'a> {
+    session: Option<&'a str>,
     observed_session: &'a mut Option<String>,
 }
 
 async fn execute_with_connection(
     engine: Engine, executable: &Path, model: Option<&str>, cwd: &Path,
     prompt: &str, env: &[(String, String)], permission_mode: PermissionMode,
-    cancel: CancellationToken, mut connection: Option<OpenCodeConnection<'_>>,
+    cancel: CancellationToken, mut opencode_run: Option<OpenCodeRun<'_>>,
     mut on_text: impl FnMut(&str), mut on_tool: impl FnMut(ExternalToolEvent),
 ) -> Result<String> {
     let mut command = tokio::process::Command::new(executable);
@@ -1197,18 +1117,19 @@ async fn execute_with_connection(
         Engine::Pi => {
             command.args(["--mode", "json", "--print", "--no-session", "--no-context-files"]);
             if permission_mode == PermissionMode::Deny { command.arg("--no-tools"); }
+            if let Some(model) = model { command.args(["--model", model]); }
         }
         Engine::OpenCode => {
             command.args(["run", "--format", "json"]);
-            if let Some(connection) = &connection {
-                command.args(["--attach", connection.url]);
-                command.env("OPENCODE_SERVER_PASSWORD", connection.password);
-                if let Some(session) = connection.native_session {
-                    command.args(["--session", session]);
-                }
+            if let Some(run) = &opencode_run {
+                if let Some(session) = run.session { command.args(["--session", session]); }
             }
             if permission_mode == PermissionMode::Auto { command.arg("--auto"); }
             if permission_mode == PermissionMode::Deny { command.args(["--agent", "plan", "--pure"]); }
+            // `--model` 必须拼在 `--` 之前：`--` 之后全部成为消息正文。
+            // 真机反证——曾在 `--` 之后追加时，服务器收到的用户消息是
+            // 「你好 --model dandelion/Qwen3.8-Flash-Next」，--model 从未生效。
+            if let Some(model) = model { command.args(["--model", model]); }
             // `opencode run` takes the message as a positional argument. Its
             // current CLI ignores a prompt written only to stdin and exits 0
             // without a text event. `--` also protects prompts starting `-`.
@@ -1221,9 +1142,9 @@ async fn execute_with_connection(
                 PermissionMode::Deny => { command.args(["--permission-mode", "dontAsk"]); }
                 PermissionMode::Ask => {}
             }
+            if let Some(model) = model { command.args(["--model", model]); }
         }
     }
-    if let Some(model) = model { command.args(["--model", model]); }
     // 同上：可执行文件已解析成功，spawn 失败属于运行期启动故障
     // （Provider），与“模型未配置”（NotConfigured）严格区分。
     let mut child = command
@@ -1270,9 +1191,9 @@ async fn execute_with_connection(
         };
         let Some(line) = line else { break; };
         let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else { continue; };
-        if let Some(connection) = &mut connection {
+        if let Some(run) = &mut opencode_run {
             if let Some(native_id) = event["sessionID"].as_str() {
-                *connection.observed_session = Some(native_id.to_owned());
+                *run.observed_session = Some(native_id.to_owned());
             }
         }
         if engine == Engine::ClaudeCode && event["type"] == "result"
@@ -1965,7 +1886,7 @@ mod tests {
         let sessions = AgentSessions::default();
         for (prompt, expected) in [("first", "turn-1"), ("second", "turn-2")] {
             let answer = sessions.execute(Engine::Pi, "conversation", &cli, None,
-                dir.path(), prompt, prompt, &[], PermissionMode::Deny, 1_000,
+                dir.path(), prompt, prompt, &[], PermissionMode::Deny,
                 &[], None, &[], None, CancellationToken::new(), |_| {}, |_| {}).await.unwrap();
             assert_eq!(answer, expected);
         }
@@ -1984,7 +1905,7 @@ mod tests {
         std::fs::write(&bridge_file, "// extension").unwrap();
         let sessions = AgentSessions::default();
         let answer = sessions.execute(Engine::Pi, "conversation", &cli, None,
-            dir.path(), "hello", "hello", &[], PermissionMode::Deny, 1_000,
+            dir.path(), "hello", "hello", &[], PermissionMode::Deny,
             &[], None, &[], Some(&bridge_file), CancellationToken::new(), |_| {}, |_| {}).await.unwrap();
         assert_eq!(answer, "ok");
         sessions.close("conversation");
@@ -1993,24 +1914,70 @@ mod tests {
         assert!(args.contains("pi-wiki-tok.js"), "{args}");
     }
 
+    /// 直启 run 形态的续接回归：带 `--session <原生 ID>`、绝不出现
+    /// `--attach`（attach 会把 text/tool 事件全部吞掉，真机 v1.18.35 与
+    /// v1.19.3 均复现）；`--model` 必须排在 `--` 之前，否则会被并进消息
+    /// 正文（真机曾把用户消息发成「你好 --model …」）。
     #[cfg(windows)]
     #[tokio::test]
-    async fn opencode_attach_tracks_native_session_id() {
+    async fn opencode_run_continues_session_and_puts_model_first() {
         let dir = tempfile::tempdir().unwrap();
         let cli = dir.path().join("fake-opencode.cmd");
         std::fs::write(&cli, "@echo off\r\necho %* >\"%~dp0args.txt\"\r\necho {\"type\":\"text\",\"sessionID\":\"native-123\",\"part\":{\"text\":\"ok\"}}\r\n").unwrap();
         let mut observed = None;
-        let answer = execute_with_connection(Engine::OpenCode, &cli, None, dir.path(),
+        let answer = execute_with_connection(Engine::OpenCode, &cli, Some("m1"), dir.path(),
             "hello", &[], PermissionMode::Auto, CancellationToken::new(),
-            Some(OpenCodeConnection { url: "http://127.0.0.1:1234", password: "secret",
-                native_session: Some("native-previous"), observed_session: &mut observed }),
+            Some(OpenCodeRun { session: Some("native-previous"), observed_session: &mut observed }),
             |_| {}, |_| {}).await.unwrap();
         assert_eq!(answer, "ok");
         assert_eq!(observed.as_deref(), Some("native-123"));
-        let args = std::fs::read_to_string(dir.path().join("args.txt")).unwrap();
-        assert!(args.contains("--attach http://127.0.0.1:1234"));
-        assert!(args.contains("--session native-previous"));
-        assert!(args.contains("-- hello"), "OpenCode prompt must be positional: {args}");
+        let raw = std::fs::read_to_string(dir.path().join("args.txt")).unwrap();
+        assert!(!raw.contains("--attach"), "不得回到丢事件的 attach 形态：{raw}");
+        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        let dash = tokens.iter().rposition(|a| *a == "--").expect("`--` 分隔必须在场");
+        let session = tokens.iter().position(|a| *a == "--session")
+            .expect("续接必须带 --session");
+        assert_eq!(tokens[session + 1], "native-previous");
+        assert!(session < dash, "--session 必须在 `--` 之前：{tokens:?}");
+        let model = tokens.iter().position(|a| *a == "--model").expect("--model 必须在场");
+        assert!(model < dash, "--model 必须在 `--` 之前，否则被并进消息正文：{tokens:?}");
+        assert_eq!(tokens[model + 1], "m1");
+        assert_eq!(tokens[dash + 1], "hello", "OpenCode prompt must be positional: {raw}");
+    }
+
+    /// `execute_opencode` 层的状态机：首轮捕获 sessionID 落条目；次轮
+    /// 配置一致 → argv 带 `--session`；改配置（换 model）→ 回退新会话，
+    /// argv 不带 `--session`。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn opencode_execute_continues_only_with_unchanged_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("fake-opencode.cmd");
+        // 每次调用覆盖写 args.txt，断言的总是"最后这一轮实际收到了什么"。
+        std::fs::write(&cli, "@echo off\r\necho %* >\"%~dp0args.txt\"\r\necho {\"type\":\"text\",\"sessionID\":\"native-123\",\"part\":{\"text\":\"ok\"}}\r\n").unwrap();
+        let args_file = dir.path().join("args.txt");
+        let sessions = AgentSessions::default();
+        async fn run(sessions: &AgentSessions, cli: &Path, cwd: &Path,
+            model: Option<&str>, prompt: &str) -> String {
+            sessions.execute(Engine::OpenCode, "conversation", cli, model, cwd,
+                prompt, prompt, &[], PermissionMode::Auto,
+                &[], None, &[], None, CancellationToken::new(), |_| {}, |_| {}).await.unwrap()
+        }
+        // 首轮：新会话，不带 --session；sessionID 回写会话状态。
+        assert_eq!(run(&sessions, &cli, dir.path(), Some("m1"), "first").await, "ok");
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        assert!(!args.contains("--session"), "首轮必须开新会话：{args}");
+        assert_eq!(sessions.session_ids(Engine::OpenCode), vec!["conversation".to_string()]);
+        // 次轮：配置一致 → 续接原生会话。
+        assert_eq!(run(&sessions, &cli, dir.path(), Some("m1"), "second").await, "ok");
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        assert!(args.contains("--session native-123"), "配置一致必须续接：{args}");
+        // 换 model：配置漂移 → 回退新会话（调用方据此换用 fresh_prompt）。
+        assert_eq!(run(&sessions, &cli, dir.path(), Some("m2"), "third").await, "ok");
+        let args = std::fs::read_to_string(&args_file).unwrap();
+        assert!(!args.contains("--session"), "配置漂移必须回退新会话：{args}");
+        assert!(args.contains("--model m2"), "新配置的 --model 必须生效：{args}");
+        sessions.close("conversation");
     }
 
     /// 与托管安装同形的真实 npm 布局：`.bin\opencode.cmd` 使用 npm 实际
@@ -2113,7 +2080,7 @@ mod tests {
             "-dash-leading message",
             "line one\nline two\nend",
         ] {
-            let answer = execute_with_connection(Engine::OpenCode, &chosen, None, dir.path(),
+            let answer = execute_with_connection(Engine::OpenCode, &chosen, Some("probe/model"), dir.path(),
                 prompt, &[], PermissionMode::Auto, CancellationToken::new(), None,
                 |_| {}, |_| {}).await
                 .unwrap_or_else(|err| panic!("prompt {prompt:?} 应成功送达原生 exe：{err}"));
@@ -2125,6 +2092,10 @@ mod tests {
             }
             let dash = argv.iter().rposition(|a| *a == "--").expect("`--` 分隔必须在场");
             assert_eq!(argv[dash + 1], prompt, "消息必须逐字作为 `--` 后的位置参数：{argv:?}");
+            // `--model` 若落在 `--` 之后就会被并入消息正文（真机反证），必须在分隔符前。
+            let model = argv.iter().position(|a| *a == "--model").expect("--model 必须在场");
+            assert!(model < dash, "--model 必须在 `--` 之前：{argv:?}");
+            assert_eq!(argv[model + 1], "probe/model");
         }
     }
 
