@@ -1328,10 +1328,29 @@ async fn sessions_list(
         .map_err(map_err)
 }
 
+/// 空间列表，每行额外带 `accessible`：目录当前是否读得到。
+///
+/// 读不到（移动盘没插、网络盘没连）只影响这一个字段，数据原样保留，由界面
+/// 提示用户；这取代了旧的「启动时目录不在就连会话一起删」的自动清理。
 #[tauri::command]
-async fn projects_list(state: State<'_, AppState>) -> Result<Vec<ProjectRow>, String> {
+async fn projects_list(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
     let rt = state.runtime.read().await;
-    rt.projects_list().map_err(map_err)
+    rt.projects_list()
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    let mut value = serde_json::to_value(&row).unwrap_or(serde_json::Value::Null);
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert(
+                            "accessible".into(),
+                            serde_json::Value::Bool(Path::new(&row.workspace).is_dir()),
+                        );
+                    }
+                    value
+                })
+                .collect()
+        })
+        .map_err(map_err)
 }
 
 #[tauri::command]
@@ -1351,8 +1370,10 @@ async fn project_delete(
 ) -> Result<(), String> {
     let rt = state.runtime.read().await;
     // 桌面端的工作空间是会话的归属单位，默认连会话一起删；显式传 false 才是
-    // 旧行为（把会话归档、只撤掉书签）。
+    // 旧行为（把会话归档、只撤掉书签）。Runtime::project_delete 会先取消并
+    // 限时等待牵连会话的运行任务、收掉后台进程树，再删记录（工作单条目 2）。
     rt.project_delete(&id, purge_sessions.unwrap_or(true))
+        .await
         .map_err(map_err)
 }
 
@@ -1402,12 +1423,10 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     }
 }
 
-/// 清掉目录已不存在的工作空间（连同其会话），返回被清掉的那些，供界面提示。
-#[tauri::command]
-async fn projects_prune_missing(state: State<'_, AppState>) -> Result<Vec<ProjectRow>, String> {
-    let rt = state.runtime.read().await;
-    rt.projects_prune_missing().map_err(map_err)
-}
+// 「目录当前不存在就批量清掉空间连同会话」的 `projects_prune_missing` 命令已
+// 移除：启动时目录读不到多半是移动盘/网络盘没就位，不是用户要删。误接一次就
+// 是永久丢数据，所以这个入口整个拿掉。空间级删除走 `project_delete`（侧栏右键
+// 的用户动作），批量清理由 `projects_prune_empty` 承担。
 
 /// 清掉一个对话都没有的工作空间，返回被清掉的那些（`dry_run` 时只返回名单）。
 ///
@@ -1857,11 +1876,13 @@ async fn context_status(
         if let Some(p) = prefs.workspace {
             Some(p)
         } else {
-            rt.session_export(&sid).ok().and_then(|v| {
-                v.get("workspace")
-                    .and_then(|w| w.as_str())
-                    .map(PathBuf::from)
-            })
+            // 兜底只读会话元数据行。旧实现走 session_export，为了拿一个
+            // workspace 字段把整个会话历史读出来序列化，长会话下白白贵一截。
+            rt.get_session(&sid)
+                .ok()
+                .flatten()
+                .filter(|row| !row.workspace.is_empty())
+                .map(|row| PathBuf::from(row.workspace))
         }
     } else {
         None
@@ -3864,23 +3885,58 @@ fn host_permission_pending(state: State<'_, AppState>) -> Vec<PermissionEvent> {
         .collect()
 }
 
+/// 把 Runtime 总线抽给一个接收方；Closed 或代际更替时结束。
+/// 单独抽出来是为了能测到最疼的那条分支：接收队列 Lagged 时旧实现直接
+/// `continue`，丢多少帧、丢了什么状态一概不知。现在把丢失条数交给
+/// `on_lagged`（真实实现记日志并通知前端按落库状态重建），不再静默。
+async fn pump_bus(
+    rx: &mut broadcast::Receiver<dandelion_core::BusFrame>,
+    alive: impl Fn() -> bool,
+    on_frame: impl Fn(&dandelion_core::BusFrame) -> bool,
+    mut on_lagged: impl FnMut(u64),
+) {
+    loop {
+        if !alive() {
+            return;
+        }
+        match rx.recv().await {
+            Ok(frame) => {
+                if !on_frame(&frame) {
+                    return;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(missed)) => on_lagged(missed),
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
 fn spawn_bus_forwarder(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        // 跨代际累计：断一次网重订阅不该把「今天一共丢了多少」清零。
+        let lagged_total = std::sync::atomic::AtomicU64::new(0);
         loop {
             let gen = app.state::<AppState>().bus_gen.load(Ordering::SeqCst);
             let mut rx = app.state::<AppState>().runtime.read().await.subscribe();
-            loop {
-                if app.state::<AppState>().bus_gen.load(Ordering::SeqCst) != gen {
-                    break;
-                }
-                match rx.recv().await {
-                    Ok(frame) => {
-                        let _ = app.emit("session-update", &frame);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
+            pump_bus(
+                &mut rx,
+                || app.state::<AppState>().bus_gen.load(Ordering::SeqCst) == gen,
+                |frame| {
+                    let _ = app.emit("session-update", frame);
+                    true
+                },
+                |missed| {
+                    let missed = missed as u64;
+                    let total = lagged_total.fetch_add(missed, Ordering::SeqCst) + missed;
+                    tracing::warn!(
+                        missed,
+                        lagged_total = total,
+                        "session-update subscriber lagged; telling frontend to resync from persisted state"
+                    );
+                    let _ = app.emit("bus-lagged", json!({ "missed": missed, "total": total }));
+                },
+            )
+            .await;
         }
     });
 }
@@ -3933,8 +3989,11 @@ pub fn run() {
     let host = Arc::new(DesktopHost::new_default());
     let account_host = accounts::AccountHost::default();
     let lease = account_host.lease.clone();
+    let grace = account_host.grace.clone();
     host.set_execution_guard(Arc::new(move || {
-        if accounts::lease_valid(&lease) {Ok(())} else {Err(dandelion_core::Error::NotConfigured("有效的应用使用授权".into()))}
+        // 断网宽限期内放行的仍是同一份授权（撤销会同时清零租约与宽限），
+        // 因此已授予过的工作可跨一次短暂断网继续，撤销后行为与 v0.0.1 一致。
+        if accounts::lease_valid(&lease) || accounts::grace_valid(&grace) {Ok(())} else {Err(dandelion_core::Error::NotConfigured("有效的应用使用授权".into()))}
     }));
     let data_dir = host.data_dir();
     let _ = Settings::write_template_if_absent(&data_dir);
@@ -4096,7 +4155,6 @@ pub fn run() {
             project_rename,
             project_unlist,
             project_reveal,
-            projects_prune_missing,
             projects_prune_empty,
             session_set_title,
             session_set_pinned,
@@ -4370,6 +4428,84 @@ mod tests {
             !frame.belongs_to_session(&parent),
             "subscribe filter must drop child idle"
         );
+    }
+
+    /// 工作单 2026-10-19 第二版·条目 4：接收队列 Lagged 不许再静默 continue。
+    /// 容量 1 的通道灌 3 帧必然落后 —— pump 必须把丢失条数交出来，
+    /// 并且不停机：落后之后还要继续把剩下的帧送完。
+    #[tokio::test]
+    async fn pump_bus_reports_lag_then_keeps_pumping() {
+        use super::pump_bus;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<dandelion_core::BusFrame>(1);
+        let mk = |seq: u64| {
+            BusFrame::session_update(
+                seq,
+                SessionNotification {
+                    session_id: SessionId::parse("tsk_pump").unwrap(),
+                    update: SessionUpdate::idle("end_turn"),
+                },
+            )
+        };
+        tx.send(mk(1)).unwrap();
+        tx.send(mk(2)).unwrap();
+        tx.send(mk(3)).unwrap();
+        drop(tx); // 之后通道无发送方：收完现存帧泵自然结束（Closed）。
+        let delivered = AtomicUsize::new(0);
+        let lags = std::sync::Mutex::new(Vec::<u64>::new());
+        let alive = AtomicBool::new(true);
+        pump_bus(
+            &mut rx,
+            || alive.load(AtomicOrdering::Relaxed),
+            |_| {
+                delivered.fetch_add(1, AtomicOrdering::Relaxed);
+                true
+            },
+            |missed| lags.lock().unwrap().push(missed as u64),
+        )
+        .await;
+        assert_eq!(*lags.lock().unwrap(), vec![2], "落后 2 帧必须被数出来并上报");
+        assert_eq!(delivered.load(AtomicOrdering::Relaxed), 1, "落后不是停机理由，最新帧仍要送达");
+    }
+    /// 会话切换工作单（2026-10-19）：移动盘/网络盘暂时没就位曾触发启动即删对话。
+    /// 现在宿主不再暴露「目录缺失就批量删除」的命令，空间列表只带 `accessible`
+    /// 提示；此测试钉死这条边界，防止有人把自动删除接回来。
+    #[test]
+    fn startup_must_not_purge_missing_workspaces() {
+        let src = include_str!("lib.rs");
+        assert!(
+            // concat! 拆开字面量：include_str 把本测试也读进 src，
+            // 断言字符串本身不能成为被搜索的完整文本。
+            !src.contains(concat!("async fn projects_prune_", "missing")),
+            "宿主不得再暴露 projects_prune_missing 命令：启动读不到目录不是删除理由"
+        );
+        assert!(
+            src.contains("\"accessible\""),
+            "projects_list 必须给每行带 accessible，让侧栏能显示「暂时不可访问」而不是消失"
+        );
+        // 前端也不许残留调用（注释里的说明性提及没有左括号，不会误伤）。
+        let fe = Path::new(env!("CARGO_MANIFEST_DIR")).join("../src");
+        for entry in walkdir::WalkDir::new(&fe)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file()
+                || !matches!(
+                    path.extension().and_then(|s| s.to_str()),
+                    Some("ts" | "vue" | "js" | "mjs")
+                )
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            assert!(
+                !text.contains("projectsPruneMissing(")
+                    && !text.contains("invoke(\"projects_prune_missing\""),
+                "前端残留自动删除调用: {}",
+                path.display()
+            );
+        }
     }
 
     #[test]

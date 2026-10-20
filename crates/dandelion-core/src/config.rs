@@ -111,6 +111,11 @@ const KEY_DELEGATION_STALE_IDLE_SEC: &str = "dandelion.delegation.staleIdleSec";
 const KEY_DELEGATION_STALE_IN_TOOL_SEC: &str = "dandelion.delegation.staleInToolSec";
 const KEY_DELEGATION_WORKTREE_ISOLATION: &str = "dandelion.delegation.worktreeIsolation";
 const KEY_ACCOUNT_RECHECK_MS: &str = "dandelion.account.recheckMs";
+/// Transient-auth-failure grace window: how long a previously granted
+/// access lease keeps working when the account service is briefly
+/// unreachable. Explicit revocation ignores this entirely. 0 = disabled
+/// (fail closed on the first network error, the pre-2026-10 behaviour).
+const KEY_ACCOUNT_GRACE_MS: &str = "dandelion.account.graceMs";
 const KEY_CRON_TICK_SEC: &str = "dandelion.cron.tickSec";
 const KEY_CRON_MAX_CONCURRENT: &str = "dandelion.cron.maxConcurrent";
 const KEY_SESSION_LIST_LIMIT: &str = "dandelion.session.listLimit";
@@ -314,6 +319,7 @@ const KNOWN_KEYS: &[&str] = &[
     KEY_DELEGATION_STALE_IN_TOOL_SEC,
     KEY_DELEGATION_WORKTREE_ISOLATION,
     KEY_ACCOUNT_RECHECK_MS,
+    KEY_ACCOUNT_GRACE_MS,
     KEY_CRON_TICK_SEC,
     KEY_CRON_MAX_CONCURRENT,
     KEY_SESSION_LIST_LIMIT,
@@ -660,6 +666,10 @@ pub struct Settings {
     /// worktree by default; the parent merges or discards explicitly.
     pub delegation_worktree_isolation: bool,
     pub account_recheck_ms: u64,
+    /// See `KEY_ACCOUNT_GRACE_MS`: bounded grace for transient account
+    /// service failures while a grant exists. Never applies to explicit
+    /// revocation.
+    pub account_grace_ms: u64,
     pub cron_tick_sec: u64,
     pub cron_max_concurrent: u32,
     pub session_list_limit: u32,
@@ -879,6 +889,7 @@ impl Settings {
             delegation_stale_in_tool_sec: 1_200,
             delegation_worktree_isolation: true,
             account_recheck_ms: 30_000,
+            account_grace_ms: 300_000,
             cron_tick_sec: 60,
             cron_max_concurrent: 1,
             session_list_limit: 50,
@@ -1342,6 +1353,11 @@ impl Settings {
         }
         if !(1000..=300_000).contains(&self.account_recheck_ms) {
             return Err(Error::Settings(format!("{KEY_ACCOUNT_RECHECK_MS} must be 1000–300000")));
+        }
+        if self.account_grace_ms > 3_600_000 {
+            return Err(Error::Settings(format!(
+                "{KEY_ACCOUNT_GRACE_MS} must be 0–3600000"
+            )));
         }
         if self.cron_tick_sec < 1 {
             return Err(Error::Settings(format!("{KEY_CRON_TICK_SEC} must be >= 1")));
@@ -1947,6 +1963,7 @@ impl Settings {
             Value::Bool(self.delegation_worktree_isolation),
         );
         map.insert(KEY_ACCOUNT_RECHECK_MS.into(), json_u64(self.account_recheck_ms));
+        map.insert(KEY_ACCOUNT_GRACE_MS.into(), json_u64(self.account_grace_ms));
         map.insert(KEY_CRON_TICK_SEC.into(), json_u64(self.cron_tick_sec));
         map.insert(
             KEY_CRON_MAX_CONCURRENT.into(),
@@ -2493,6 +2510,7 @@ fn apply_json(settings: &mut Settings, value: &Value) -> Result<()> {
                 settings.delegation_worktree_isolation = req_bool(key, val)?;
             }
             KEY_ACCOUNT_RECHECK_MS => settings.account_recheck_ms = req_u64(key, val)?,
+            KEY_ACCOUNT_GRACE_MS => settings.account_grace_ms = req_u64(key, val)?,
             KEY_CRON_TICK_SEC => settings.cron_tick_sec = req_u64(key, val)?,
             KEY_CRON_MAX_CONCURRENT => settings.cron_max_concurrent = req_u32(key, val)?,
             KEY_SESSION_LIST_LIMIT => settings.session_list_limit = req_u32(key, val)?,

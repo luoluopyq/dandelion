@@ -64,6 +64,8 @@ export interface ProjectRow {
   workspace: string;
   createdAt: string;
   updatedAt: string;
+  /** 目录当前是否读得到（后端 projects_list 附带）。false 只提示、不动数据。 */
+  accessible?: boolean;
 }
 
 export interface TodoItem {
@@ -641,6 +643,9 @@ export interface LiveTerminal {
   background?: boolean;
   startedAt?: number;
   status?: "running" | "exited" | "killed" | "timeout";
+  // 事件总线丢帧后重同步：运行已结束却没收到退出帧的终端，状态标为
+  // 未确认（后端暂无终端快照可重放，只能如实标注，不许装作正常）。
+  unverified?: boolean;
 }
 
 export interface BackgroundProcess {
@@ -845,7 +850,7 @@ export interface AccountUser { id:string;email:string;name:string;role:string;st
 export interface AccountDevice {id:number;userId:string;installId:string;name:string;lastSeen:string}
 export interface AccountProfile {deviceWarning?:string;user:AccountUser;features:string[];maxDevices:number;devices:AccountDevice[]}
 export interface ApplicationAccess {allowed:boolean;code:string;message:string;validForMs:number}
-export interface AccountStatus {access:ApplicationAccess|null;configured:boolean;serverUrl:string;profile:AccountProfile|null;message:string|null;version:string;channel:string;updateKeyConfigured:boolean;canInstall:boolean}
+export interface AccountStatus {access:ApplicationAccess|null;configured:boolean;serverUrl:string;profile:AccountProfile|null;message:string|null;version:string;channel:string;updateKeyConfigured:boolean;canInstall:boolean;/** 断网宽限期：授权未被撤销、只是暂时无法复核，界面应保持可用 */grace:boolean}
 export interface AccountPlan {key:string;name:string;priceCents:number;days:number;maxDevices:number;features:string;enabled:boolean}
 export interface AccountOrder {id:string;userId:string;plan:string;amountCents:number;days:number;status:string;settlementId:string|null;createdAt:string}
 export interface DesktopUpdate {id:string;version:string;notes:string;pub_date:string;url:string;signature:string}

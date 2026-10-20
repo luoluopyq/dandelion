@@ -302,10 +302,9 @@ export function projectReveal(workspace: string): Promise<void> {
   return invoke("project_reveal", { workspace });
 }
 
-/** 清掉目录已不存在的工作空间（连同其会话），返回被清掉的那些。 */
-export function projectsPruneMissing(): Promise<ProjectRow[]> {
-  return invoke("projects_prune_missing");
-}
+// 「目录当前不存在就连空间带对话批量删除」的 projectsPruneMissing 已删除。
+// 启动/刷新时目录读不到多半是移动盘、网络盘还没就位，不是用户要删；误接一次
+// 就是不可恢复的数据丢失，所以这个 IPC 入口整个拿掉，删除只走 project_delete。
 
 /**
  * 清掉一个对话都没有的工作空间，返回被清掉的那些。
@@ -1167,7 +1166,9 @@ export function projectMemoryMetrics(): Promise<{ total: number; degraded: numbe
 }
 
 // Account secrets stay in the Rust host; no token enters Vue/localStorage.
-export const accountStatus=()=>invoke<import('./types').AccountStatus>('account_status');
+// 后端对同一份授权做 TTL 缓存 + single-flight：启动期 App/TitleBar/监控循环
+// 背靠背查询只会打一次网络。force=true 供用户主动刷新绕过缓存。
+export const accountStatus=(force=false)=>invoke<import('./types').AccountStatus>('account_status',force?{force:true}:{});
 export const accountRegister=(email:string,name:string,password:string)=>invoke<void>('account_register',{email,name,password});
 export const accountLogin=(email:string,password:string)=>invoke<import('./types').AccountProfile>('account_login',{email,password});
 export const accountLogout=()=>invoke<void>('account_logout');

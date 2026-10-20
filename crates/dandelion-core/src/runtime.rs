@@ -165,6 +165,12 @@ pub struct SandboxRoots {
 struct SessionSlot {
     busy: bool,
     cancel: CancellationToken,
+    /// 本轮 `begin_session` 时已解析出的工作目录（`to_string_lossy`，与
+    /// `ensure_session` 写入行里的 workspace 同一拼写）。会话行要到回合
+    /// 中段才落库，而 busy 在 begin_session 就可见 —— `project_delete`
+    /// 靠它兜住「内存里在跑、库里还没行」的回合（工作单 2026-10-19
+    /// 第二版·条目 2 的补漏），否则空间删了回合还挂着往已删空间写。
+    workspace: Option<String>,
 }
 
 struct ChildInherit {
@@ -2622,7 +2628,7 @@ impl Runtime {
         let project = render_project_segment(&bundle.files);
         let context = Arc::new(Mutex::new(ContextSession::from_bundle(&bundle, &settings)));
 
-        let cancel = self.begin_session(&session_id)?;
+        let cancel = self.begin_session(&session_id, Some(workspace.to_string_lossy().into_owned()))?;
         let preflight_started = Instant::now();
         if settings.preflight_enabled && self.inner.preflight.allow() {
             let inference = self.preflight_inference(&settings);
@@ -2995,7 +3001,7 @@ impl Runtime {
                 }
             }
         }
-        let cancel = self.begin_session(&session_id)?;
+        let cancel = self.begin_session(&session_id, Some(workspace.to_string_lossy().into_owned()))?;
         let run_id = crate::trace::RunId::new();
         let started = Instant::now();
         let mut transcript = String::new();
@@ -3218,6 +3224,7 @@ impl Runtime {
                 existing_dir(&std::env::current_dir()?)?
             }
         };
+        let slot_workspace = workspace.to_string_lossy().into_owned();
         let fs = WorkspaceFs::with_extra_roots(workspace, &settings.sandbox_allow_roots)?;
         let model = prefs
             .model
@@ -3239,7 +3246,7 @@ impl Runtime {
         let max_tokens = prefs.max_tokens.unwrap_or(settings.max_tokens);
         let thinking_intensity = settings.thinking_intensity;
         let max_iterations = settings.max_iterations;
-        let cancel = self.begin_session(session_id)?;
+        let cancel = self.begin_session(session_id, Some(slot_workspace))?;
         let settings = Arc::new(settings);
         let emit_rt = self.clone();
         let sid_emit = session_id.clone();
@@ -3678,6 +3685,7 @@ impl Runtime {
                 .or_insert_with(|| SessionSlot {
                     busy: false,
                     cancel: CancellationToken::new(),
+                    workspace: None,
                 });
             (slot.cancel.clone(), slot.busy)
         };
@@ -3706,6 +3714,7 @@ impl Runtime {
     pub fn background_processes(&self, session_id: &SessionId) -> Vec<crate::jobs::BackgroundProcess> {
         self.inner.jobs.background_processes(session_id, self.settings().terminal_output_max_bytes)
     }
+
 
     /// Run a command explicitly entered by the desktop user. This is not an
     /// agent turn: it reuses the existing process table and ACP live-terminal
@@ -3756,7 +3765,12 @@ impl Runtime {
         Ok(result)
     }
 
-    fn begin_session(&self, id: &SessionId) -> Result<CancellationToken> {
+    /// 占用一个会话开新回合，返回本轮的取消令牌。
+    ///
+    /// `workspace` 是调用方已解析好的本轮目录（`resolve_workspace` 的结果），
+    /// 在 busy 变可见的同一条锁里盖章进槽位 —— `project_delete` 就是靠它
+    /// 在会话行落库**之前**也能认出「这个回合属于哪个空间」（条目 2）。
+    fn begin_session(&self, id: &SessionId, workspace: Option<String>) -> Result<CancellationToken> {
         let mut map = self
             .inner
             .sessions
@@ -3765,12 +3779,14 @@ impl Runtime {
         let slot = map.entry(id.clone()).or_insert_with(|| SessionSlot {
             busy: false,
             cancel: CancellationToken::new(),
+            workspace: None,
         });
         if slot.busy {
             return Err(Error::SessionBusy(id.to_string()));
         }
         slot.busy = true;
         slot.cancel = CancellationToken::new();
+        slot.workspace = workspace;
         Ok(slot.cancel.clone())
     }
 
@@ -3902,8 +3918,16 @@ impl Runtime {
                 .and_then(|m| m.get(&req.parent).cloned())
                 .ok_or_else(|| "Error: parent inherit missing".to_string())?;
             let child = SessionId::new();
+            // 子回合继承父槽位的目录标注：删空间时按目录认领挂着的子回合，
+            // 与行落库与否无关（父槽位已不在/无标注则回落 DB 途径）。
+            let child_workspace = self
+                .inner
+                .sessions
+                .lock()
+                .ok()
+                .and_then(|slots| slots.get(&req.parent).and_then(|slot| slot.workspace.clone()));
             let slot_cancel = self
-                .begin_session(&child)
+                .begin_session(&child, child_workspace)
                 .map_err(|err| format!("Error: {err}"))?;
             let parent_tok = req.parent_cancel.clone();
             let linked = slot_cancel.clone();
@@ -4473,6 +4497,13 @@ impl Runtime {
         self.inner.store.sessions_list(limit, offset)
     }
 
+    /// 单个会话的元数据行（标题、工作区、父子关系…），不碰消息表。
+    /// 宿主只需要 workspace / title 这类字段时走这里，不要为了取一个字段去
+    /// `session_export` 把整个会话历史读出来序列化。
+    pub fn get_session(&self, session_id: &SessionId) -> Result<Option<SessionRow>> {
+        self.inner.store.get_session(session_id)
+    }
+
     pub fn projects_list(&self) -> Result<Vec<ProjectRow>> {
         self.inner.store.projects_list()
     }
@@ -4481,7 +4512,82 @@ impl Runtime {
         self.inner.store.project_create(workspace)
     }
 
-    pub fn project_delete(&self, id: &str, purge_sessions: bool) -> Result<()> {
+    /// 删除工作空间；`purge_sessions` 时先停掉牵连会话的一切活动再删记录。
+    ///
+    /// 顺序是钉死的（工作单 2026-10-19 第二版·条目 2）：解析 doomed 名单 →
+    /// 取消名单内运行中的回合（`cancel` 一并杀会话后台进程树与子代理树）→
+    /// 等 busy 落定 → 才动 store。对照 ref/codex residency 的
+    /// `is_unloadable + shutdown_and_wait → remove_thread`：记录绝不能在被
+    /// 删除时仍有回合在往里写。等待限时 3 秒、100ms 一探（与文件内其他安全
+    /// 兜底同规格）；超时就带着未落定项继续删——取消信号已发出，阻塞在
+    /// 不可中断调用上的回合属病态，不能让删除永远点不动。
+    ///
+    /// 归属认定有两路来源，缺一不可：库里已落行的会话（doomed CTE），以及
+    /// 内存槽位上的目录标注。`new_session` 不落库，会话行要到回合中段才写，
+    /// 而 busy 在 `begin_session` 就可见 —— 删除若恰好落在两者之间的窗口，
+    /// 纯 DB 名单是空的，会把空间先删掉、回合还挂着往已删空间写
+    /// （`session_space_safety::deleting_a_running_project_…` 在并发下抓到过）。
+    /// 槽位标注与 DB 的匹配口径完全一致：`slots.workspace` 与
+    /// `sessions.workspace` 存的是同一个 `to_string_lossy` 拼写，都与
+    /// `projects.workspace` 做串等比较。
+    pub async fn project_delete(&self, id: &str, purge_sessions: bool) -> Result<()> {
+        if purge_sessions {
+            let doomed: HashSet<SessionId> = self
+                .inner
+                .store
+                .project_session_ids(id)?
+                .iter()
+                .filter_map(|raw| SessionId::parse(raw).ok())
+                .collect();
+            let project_workspace = self
+                .inner
+                .store
+                .projects_list()?
+                .into_iter()
+                .find(|p| p.id == id)
+                .map(|p| p.workspace);
+            // 取消对象 = 名单牵连的 busy 会话 ∪ 目录标注命中本空间目录的
+            // busy 会话（后者即「行还没落库」的窗口期回合）。项目不存在时
+            // 标注一路不认领任何会话，让下面的 store 删除去报错。
+            let running: Vec<SessionId> = {
+                let slots = self
+                    .inner
+                    .sessions
+                    .lock()
+                    .map_err(|_| Error::Invalid("session lock".into()))?;
+                slots
+                    .iter()
+                    .filter(|(sid, slot)| {
+                        slot.busy
+                            && (doomed.contains(sid)
+                                || matches!((&slot.workspace, &project_workspace),
+                                            (Some(w), Some(p)) if w == p))
+                    })
+                    .map(|(sid, _)| sid.clone())
+                    .collect()
+            };
+            for sid in &running {
+                self.cancel(sid.clone()).await?;
+            }
+            let mut pending = running;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !pending.is_empty() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let slots = self
+                    .inner
+                    .sessions
+                    .lock()
+                    .map_err(|_| Error::Invalid("session lock".into()))?;
+                pending.retain(|sid| slots.get(sid).is_some_and(|slot| slot.busy));
+            }
+            // 后台进程与回合解耦：回合即使早已跑完，挂着的后台终端仍要收掉，
+            // 否则删除空间后进程还在写一个已经不存在的会话。
+            // （running 会话在 `cancel` 内已各自 kill_session，这里补全
+            // 名单里已闲下的。）
+            for sid in &doomed {
+                self.inner.jobs.kill_session(sid);
+            }
+        }
         self.inner
             .store
             .project_delete(id, purge_sessions)?
@@ -4507,7 +4613,8 @@ impl Runtime {
             .ok_or_else(|| Error::Invalid(format!("project not found: {id}")))
     }
 
-    /// 清掉目录已不存在的工作空间（连同其会话），返回被清掉的那些。
+    /// 清掉目录当前不存在的工作空间（连同其会话），返回被清掉的那些。
+    /// 破坏性操作：只允许接线到用户显式删除动作，不允许在启动/刷新时自动调。
     pub fn projects_prune_missing(&self) -> Result<Vec<ProjectRow>> {
         self.inner.store.projects_prune_missing()
     }
@@ -8924,13 +9031,46 @@ mod tests {
         let rt = test_runtime(provider);
         let sid = rt.new_session(None);
         // occupy via begin_session
-        let _tok = rt.begin_session(&sid).unwrap();
+        let _tok = rt.begin_session(&sid, None).unwrap();
         let err = rt
             .prompt(PromptRequest::new(sid.clone(), "second"))
             .await
             .unwrap_err();
         assert!(matches!(err, Error::SessionBusy(_)));
         rt.end_session(&sid);
+    }
+
+    #[tokio::test]
+    async fn project_delete_reaches_turn_before_its_session_row_lands() {
+        // 幽灵窗口（工作单 2026-10-19 第二版·条目 2 补漏）：`begin_session` 已把
+        // busy 挂上内存槽，但会话行要到回合中段才落库 —— 纯库表归因曾在这段窗口
+        // 漏掉回合，空间照删、回合还挂着往已删空间写。现在 `begin_session` 携带的
+        // 目录标注兜住它。本测试不依赖时序运气：没有行、只有内存槽。
+        let rt = test_runtime(ScriptedProvider::new(vec![]));
+        let ws = rt._workspace.path().join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        let project = rt.project_create(&ws).unwrap();
+        let sid = rt.new_session(None); // new_session 不落库
+        assert!(
+            rt.inner.store.get_session(&sid).unwrap().is_none(),
+            "前提：库里还没有这个会话的行"
+        );
+        // 标注拼写与 ensure_session 写行时一致（都是解析后路径的 to_string_lossy），
+        // 这里直接取 project.workspace 即该拼写本身。
+        let token = rt.begin_session(&sid, Some(project.workspace.clone())).unwrap();
+        // 模拟真实回合的收尾：prompt 解套时由 end_session 清 busy；
+        // 这里等取消信号到了再清，等价于回合被 project_delete 召回来落定。
+        let rt2 = rt.runtime.clone();
+        let sid2 = sid.clone();
+        let token2 = token.clone();
+        let settled = tokio::spawn(async move {
+            token2.cancelled().await;
+            rt2.end_session(&sid2);
+        });
+        rt.project_delete(&project.id, true).await.expect("删除挂着窗口期回合的空间");
+        assert!(token.is_cancelled(), "窗口期的回合也必须被取消，而不是被漏掉");
+        settled.await.unwrap();
+        assert!(!rt.has_active_turns(), "project_delete 返回时回合必须已落定");
     }
 
     #[tokio::test]

@@ -259,6 +259,13 @@ export const useSessionStore = defineStore("session", () => {
   const records = ref<Record<string, TabRecord>>({});
   const openIds = ref<string[]>([]);
   const activeId = ref("");
+  // 正在打开、还没到首帧的目标会话。UI 从点击那一刻就能给出「正在打开这个
+  // 对话」的加载态，而不是等 occupy/消息两轮 IPC 回来才有反应。
+  const pendingOpenId = ref("");
+  // 会话切换的顺序号：tryOpenSession 每被调一次自增一次，async 步骤之间用
+  // `seq === openSeq` 判断"我还是不是最后一次点击"。快速连点 A→B 时，晚回来的
+  // A 会就此让位，不会覆盖 B。
+  let openSeq = 0;
   const rows = ref<SessionRow[]>([]);
   const projects = ref<ProjectRow[]>([]);
   const runState = ref<Record<string, RunState>>({});
@@ -527,6 +534,7 @@ export const useSessionStore = defineStore("session", () => {
   });
 
   let unlistenUpdate: UnlistenFn | undefined;
+  let unlistenLagged: UnlistenFn | undefined;
   let unlistenPerm: UnlistenFn | undefined;
   let unlistenPermResolved: UnlistenFn | undefined;
   let unlistenDetachedOpen: UnlistenFn | undefined;
@@ -596,6 +604,19 @@ export const useSessionStore = defineStore("session", () => {
     return cur;
   }
 
+  // 工作单 2026-10-19 第二版·条目 7：后台终端能挂几个小时不停输出，前端不许
+  // 无界累积 —— 内存、每次 terminals 反应式拷贝、所有全文渲染都按输出总量
+  // 付费。只留尾部：任务栏和抽屉里人看的都是尾巴。重复调用是稳定的 —— 上一次的
+  // 标记会被尾巴窗口挤掉，标记始终只有一份、始终在头。
+  const TERMINAL_TEXT_CAP = 128_000;
+  const TERMINAL_TRUNCATION_MARK = "…[早期输出已截断]\n";
+  function capTerminalText(text: string): string {
+    const hadMark = text.startsWith(TERMINAL_TRUNCATION_MARK);
+    const body = hadMark ? text.slice(TERMINAL_TRUNCATION_MARK.length) : text;
+    if (body.length <= TERMINAL_TEXT_CAP) return text;
+    return TERMINAL_TRUNCATION_MARK + body.slice(body.length - TERMINAL_TEXT_CAP);
+  }
+
   function applyLiveUpdate(sessionId: string, update: BusFrame["params"]["update"]) {
     if (update.sessionUpdate === "terminal_update") {
       const rec = upsertTerminal(sessionId, update.terminalId);
@@ -606,7 +627,7 @@ export const useSessionStore = defineStore("session", () => {
         rec.startedAt ??= Date.now();
         rec.status = "running";
       }
-      if (update.output?.data) rec.text = decodeB64(update.output.data);
+      if (update.output?.data) rec.text = capTerminalText(decodeB64(update.output.data));
       if (update.exitStatus) {
         rec.exited = true;
         rec.exitCode = update.exitStatus.exitCode ?? null;
@@ -617,7 +638,7 @@ export const useSessionStore = defineStore("session", () => {
     }
     if (update.sessionUpdate === "terminal_output_chunk") {
       const rec = upsertTerminal(sessionId, update.terminalId);
-      rec.text += decodeB64(update.data);
+      rec.text = capTerminalText(rec.text + decodeB64(update.data));
       terminals.value = { ...terminals.value, [rec.terminalId]: { ...rec } };
     }
   }
@@ -637,7 +658,7 @@ export const useSessionStore = defineStore("session", () => {
           sessionId,
           command: process.command,
           cwd: process.cwd,
-          text: previous?.text || process.output,
+          text: capTerminalText(previous?.text || process.output),
           background: true,
           startedAt: previous?.startedAt ?? Date.now() - process.elapsedMs,
           status,
@@ -854,6 +875,7 @@ export const useSessionStore = defineStore("session", () => {
   // 和新 store 的监听一起触发（每次热更新累积一层，同一个 frame 被处理多次）。
   function teardownListeners() {
     unlistenUpdate?.(); unlistenUpdate = undefined;
+    unlistenLagged?.(); unlistenLagged = undefined;
     unlistenPerm?.(); unlistenPerm = undefined;
     unlistenPermResolved?.(); unlistenPermResolved = undefined;
     unlistenDetachedOpen?.(); unlistenDetachedOpen = undefined;
@@ -865,6 +887,13 @@ export const useSessionStore = defineStore("session", () => {
     if (!unlistenUpdate) {
       unlistenUpdate = await listen<BusFrame>("session-update", (ev) => {
         applyFrame(ev.payload);
+      });
+    }
+    if (!unlistenLagged) {
+      // 后端转发订阅队列 Lagged 时不再静默丢帧：它会带着丢失条数发
+      // "bus-lagged"，这里以持久化状态为准把显示重建回来。
+      unlistenLagged = await listen<{ missed: number; total: number }>("bus-lagged", (ev) => {
+        void resyncAfterLag(ev.payload);
       });
     }
     if (!unlistenPerm) {
@@ -888,6 +917,74 @@ export const useSessionStore = defineStore("session", () => {
     // focus 时向后端拉一次未决快照重放，把这个静默窗口关掉。
     window.addEventListener("focus", syncPendingPermissions);
     void syncPendingPermissions();
+  }
+
+  let lagResyncing = false;
+  let lagAgain = false;
+
+  async function resyncAfterLag(payload: { missed: number; total: number }) {
+    notice.value = `任务事件太快，界面错过了 ${payload.missed} 帧（累计 ${payload.total}），已从保存的状态重新同步。`;
+    // 同步进行中又来 lag：不并发拉两份，等这轮收尾后再来一轮，
+    // 保证最后一次重建看到的是最新落库状态。
+    if (lagResyncing) {
+      lagAgain = true;
+      return;
+    }
+    lagResyncing = true;
+    try {
+      do {
+        lagAgain = false;
+        await resyncOpenSessions();
+      } while (lagAgain);
+    } finally {
+      lagResyncing = false;
+    }
+  }
+
+  async function resyncOpenSessions() {
+    for (const id of [...openIds.value]) {
+      try {
+        const exp = await ipc.sessionExportWindow(id);
+        const rec = records.value[id];
+        if (!rec) continue;
+        const running = exp.lastRun?.status === "running";
+        // 还在跑的会话：尾部有尚未落库的直播内容，覆盖消息窗口反而会丢
+        // 已看到的输出；等这轮结束落库后，持久化状态才是完整口径。
+        if (!running) {
+          rec.messages = messagesFromExport(exp);
+          rec.historyRemaining = Math.max(0, (exp.totalMessages ?? exp.messages.length) - exp.messages.length);
+        }
+        const prev = runState.value[id] ?? { running: false, stopReason: null };
+        if (prev.running !== running) {
+          runState.value = {
+            ...runState.value,
+            [id]: {
+              running,
+              queued: false,
+              stopReason: running ? null : exp.lastRun?.stopReason ?? prev.stopReason,
+            },
+          };
+        }
+        if (!running) markTerminalsUnverified(id);
+      } catch {
+        // 重同步失败维持现状，等下一次 lag 或用户重新打开；这里不许雪上加霜。
+      }
+    }
+  }
+
+  function markTerminalsUnverified(sessionId: string) {
+    // 后端没有可重放的终端快照：运行已结束而终端记录还没收到退出帧，
+    // 说明这段状态可能正是丢掉的那批 —— 标注「未确认」，不许继续显示成
+    // 好像一切正常。
+    const next = { ...terminals.value };
+    let changed = false;
+    for (const [terminalId, rec] of Object.entries(next)) {
+      if (rec.sessionId === sessionId && !rec.exited) {
+        next[terminalId] = { ...rec, unverified: true };
+        changed = true;
+      }
+    }
+    if (changed) terminals.value = next;
   }
 
   async function syncPendingPermissions() {
@@ -941,15 +1038,24 @@ export const useSessionStore = defineStore("session", () => {
 
   async function refreshList() {
     const previous = new Set(rows.value.filter((row) => row.archived).map((row) => row.id));
-    rows.value = await ipc.sessionsList(200, 0);
-    // 归档一个对话要顺手关掉它的标签页，但从归档区主动打开的对话必须留得住。
-    // 只按 archived 过滤会把后者也踢掉（每次 refreshList 都踢一遍，标签页会自己
-    // 消失），所以这里只清理"这一次刷新中新变为归档"的那些。
-    const known = new Set(
-      rows.value.filter((row) => !row.archived || previous.has(row.id)).map((row) => row.id),
-    );
-    openIds.value = openIds.value.filter((id) => known.has(id));
-    if (activeId.value && !known.has(activeId.value)) activeId.value = openIds.value[openIds.value.length - 1] ?? "";
+    const list = await ipc.sessionsList(200, 0);
+    rows.value = list;
+    // 「不在这一页里」分两种情况，处理方式相反：
+    // - 页没装满 200 条 → 这页就是全部，不在 = 真没了（被删），该关；
+    // - 页装满 200 条 → 会话数可能超过窗口，不在 = 只是被截断，**不能关**，
+    //   否则对话攒过 200 条以后，旧标签页会被每次刷新莫名关掉一个。
+    const truncated = list.length >= 200;
+    const byId = new Map(list.map((row) => [row.id, row]));
+    const keep = (id: string) => {
+      const row = byId.get(id);
+      if (!row) return truncated;
+      // 归档一个对话要顺手关掉它的标签页，但从归档区主动打开的对话必须留得住。
+      // 只按 archived 过滤会把后者也踢掉（每次 refreshList 都踢一遍，标签页会自己
+      // 消失），所以这里只清理"这一次刷新中新变为归档"的那些。
+      return !row.archived || previous.has(id);
+    };
+    openIds.value = openIds.value.filter(keep);
+    if (activeId.value && !keep(activeId.value)) activeId.value = openIds.value[openIds.value.length - 1] ?? "";
   }
 
   async function refreshProjects() {
@@ -1023,22 +1129,21 @@ export const useSessionStore = defineStore("session", () => {
   }
 
   /**
-   * 目录被外部删掉/移走的工作空间，连同其名下的对话一起清掉。
+   * 启动/刷新后检查一遍：有没有目录暂时读不到的空间，有就提示，**什么都不删**。
    *
-   * 工作空间就是这个目录本身，目录没了条目只是个点不开的死书签。这件事是自动
-   * 发生的，所以清完必须报一声 —— 它会带走对话，不能悄悄做。
-   * 失败不拦启动：这只是尽力而为的清理。
+   * 旧实现在这里调 projectsPruneMissing：目录当前不在就连空间带对话物理删除。
+   * 但「读不到」最常见的原因是移动盘没插、网络盘没连、盘符晚到 —— 目录回来时
+   * 对话已经没了，恢复不回来。数据保留、界面标灰、用户自己决定删不删，才是
+   * 这个场景该有的行为。真删只走侧栏右键的 project_delete（显式用户动作）。
    */
-  async function pruneMissingProjects() {
+  async function notifyInaccessibleProjects() {
     try {
-      const removed = await ipc.projectsPruneMissing();
-      if (!removed.length) return;
-      const names = removed.map((item) => item.name).join("、");
-      notice.value = `已清理 ${removed.length} 个工作空间（目录已不存在：${names}），其下的对话一并删除。`;
-      await refreshProjects();
-      await refreshList();
+      const missing = projects.value.filter((project) => project.accessible === false);
+      if (!missing.length) return;
+      const names = missing.map((project) => project.name).join("、");
+      notice.value = `${missing.length} 个工作空间的目录暂时访问不到（${names}）。对话已原样保留，接上磁盘/网络后会自动恢复；确认不再需要再手动删除该空间。`;
     } catch {
-      // 清理失败不该拦住启动。
+      // 只是提示，坏了不拦启动。
     }
   }
 
@@ -1081,12 +1186,34 @@ export const useSessionStore = defineStore("session", () => {
   }
 
   async function refreshCatalog() {
-    agentPlugins.value = await ipc.agentPluginsList().catch(() => []);
-    skills.value = await ipc.skillsList();
-    mcpServers.value = await ipc.mcpList();
-    corpusDocs.value = await ipc.corpusList().catch(() => []);
-    await refreshKnowledgeSpaces();
-    sandbox.value = await ipc.sandboxRoots();
+    // 可选清单：每一项只对它自己的功能要紧。旧实现里 skillsList/mcpList/
+    // sandboxRoots 不接异常，任何一项抛错整个 refreshCatalog 就 reject，
+    // boot() 连带失败 —— 明明有能打开的会话，界面却停在空白页。现在
+    // allSettled 逐项兜底：失败只影响对应功能，聚合成一条看得懂的提示。
+    const [plugins, skillsList, mcpList, corpus, spaces, sandboxRoots] = await Promise.allSettled([
+      ipc.agentPluginsList(),
+      ipc.skillsList(),
+      ipc.mcpList(),
+      ipc.corpusList(),
+      ipc.knowledgeLocalSpaces(),
+      ipc.sandboxRoots(),
+    ]);
+    const failed: string[] = [];
+    if (plugins.status === "fulfilled") agentPlugins.value = plugins.value;
+    else { agentPlugins.value = []; failed.push("Agent 插件"); }
+    if (skillsList.status === "fulfilled") skills.value = skillsList.value;
+    else failed.push("Skills");
+    if (mcpList.status === "fulfilled") mcpServers.value = mcpList.value;
+    else failed.push("MCP 服务");
+    if (corpus.status === "fulfilled") corpusDocs.value = corpus.value;
+    else { corpusDocs.value = []; failed.push("资料库"); }
+    if (spaces.status === "fulfilled") knowledgeSpaces.value = spaces.value;
+    else { knowledgeSpaces.value = []; failed.push("知识库"); }
+    if (sandboxRoots.status === "fulfilled") sandbox.value = sandboxRoots.value;
+    else failed.push("沙箱目录");
+    if (failed.length) {
+      notice.value = `部分功能清单加载失败（${failed.join("、")}），不影响对话使用；重新打开对应面板会再次尝试加载。`;
+    }
   }
 
   async function refreshAgentPlugins() {
@@ -1151,16 +1278,15 @@ export const useSessionStore = defineStore("session", () => {
     }
     let prefs: SessionPrefs = exp.prefs ?? {};
     let binds = emptyBindings();
-    try {
-      prefs = await ipc.sessionPrefsGet(id);
-    } catch {
-      /* new or missing prefs */
-    }
-    try {
-      binds = await ipc.sessionTaskBindings(id);
-    } catch {
-      /* ignore */
-    }
+    // 两者互不依赖，并行拿，各少一轮 IPC 等待；allSettled 保住旧语义——
+    // 任何一个失败只丢它自己那份（新会话没 prefs、没绑定的会话 bindings 报错），
+    // 不影响另一个，也不让打开流程因此失败。
+    const [prefsRes, bindsRes] = await Promise.allSettled([
+      ipc.sessionPrefsGet(id),
+      ipc.sessionTaskBindings(id),
+    ]);
+    if (prefsRes.status === "fulfilled") prefs = prefsRes.value;
+    if (bindsRes.status === "fulfilled") binds = bindsRes.value;
     return {
       id: exp.id,
       title: exp.title || "未命名任务",
@@ -1203,6 +1329,8 @@ export const useSessionStore = defineStore("session", () => {
   }
 
   async function tryOpenSession(id: string): Promise<boolean> {
+    const seq = ++openSeq;
+    ipc.bootMark("open:click", `session=${id}`);
     error.value = null;
     if (openIds.value.includes(id)) {
       activeId.value = id;
@@ -1211,27 +1339,63 @@ export const useSessionStore = defineStore("session", () => {
       void refreshContext();
       return true;
     }
+    // 点击即亮加载态：目标对话立刻显示「正在打开」，后面几步慢也不至于是黑盒。
+    pendingOpenId.value = id;
+    const settle = () => {
+      if (seq === openSeq) pendingOpenId.value = "";
+    };
     try {
       await ipc.sessionOccupy(id, MAIN_SURFACE);
     } catch (err) {
       const msg = errText(err);
       const focused = await ipc.sessionFocusDetached(id).catch(() => false);
       if (focused || msg.includes("window-09")) {
-        error.value = `无法在主窗打开：该任务已在独立窗口占用（${id}）`;
+        if (seq === openSeq) error.value = `无法在主窗打开：该任务已在独立窗口占用（${id}）`;
         markDetached(id);
+        settle();
         return false;
       }
-      error.value = msg;
+      if (seq === openSeq) error.value = msg;
+      settle();
       return false;
     }
-    if (!records.value[id]) {
-      records.value = { ...records.value, [id]: await loadRecord(id) };
+    // occupy 期间用户可能又点了别的对话：这一次已被更晚的点击取代，刚占到手
+    // 就归还，让最后一次点击赢。没有这道闸，晚回来的 A 会把界面从 B 抢回去。
+    if (seq !== openSeq) {
+      void ipc.sessionRelease(id, MAIN_SURFACE).catch(() => undefined);
+      return false;
     }
-    openIds.value = [...openIds.value, id];
+    ipc.bootMark("open:occupied", `session=${id}`);
+    try {
+      if (!records.value[id]) {
+        records.value = { ...records.value, [id]: await loadRecord(id) };
+      }
+    } catch (err) {
+      // 读消息失败必须归还刚拿到的占用并把原因摆出来。旧实现不接这个异常：
+      // 一次失败点击把会话永久占在主窗，重试一直报占用，用户两头都够不着。
+      await ipc.sessionRelease(id, MAIN_SURFACE).catch(() => undefined);
+      if (seq === openSeq) error.value = `打开对话失败：${errText(err)}`;
+      settle();
+      return false;
+    }
+    if (seq !== openSeq) {
+      void ipc.sessionRelease(id, MAIN_SURFACE).catch(() => undefined);
+      return false;
+    }
+    ipc.bootMark("open:messages", `session=${id}`);
+    if (!openIds.value.includes(id)) openIds.value = [...openIds.value, id];
     activeId.value = id;
     mainView.value = "chat";
     dockPanel.value = "tasks";
+    settle();
     void refreshContext();
+    // 首帧：状态提交后下一帧再落计时，量到的是用户真正看见内容的时刻。
+    const paint = () => {
+      ipc.bootMark("open:painted", `session=${id}`);
+      void ipc.flushBootMarks().catch(() => undefined);
+    };
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(paint);
+    else setTimeout(paint, 0);
     return true;
   }
 
@@ -1319,21 +1483,36 @@ export const useSessionStore = defineStore("session", () => {
     }
     await refreshList();
     await refreshProjects();
-    // 目录被外部删掉或移走的空间在这里清掉，必须排在 refreshProjects 之后、
-    // 打开会话之前 —— 清完的项目与对话不该再被下面的候选循环捞到。
-    await pruneMissingProjects();
-    await refreshCatalog();
-    ipc.bootMark("boot:list+projects+catalog", ipc.ipcStatsDigest(6));
+    // 目录当前读不到的空间：只提示、不动数据（旧实现在这里连空间带对话删除，
+    // 移动盘/网络盘没就位就会误删，已移除）。排在 refreshProjects 之后，
+    // 提示里才拿得到刚拉回来的空间列表。
+    await notifyInaccessibleProjects();
     await refreshDetached();
-    await refreshSidecar().catch(() => undefined);
-    await listenDetachedEvents();
-    await refreshContext().catch(() => undefined);
-    ipc.bootMark("boot:context");
+    ipc.bootMark("boot:list+projects", ipc.ipcStatsDigest(6));
+    // 会话优先：插件/Skills/MCP/资料库/边车这些都是可选清单，一项挂掉
+    // 只该挂掉那项功能，旧实现却把它们排在打开会话之前串行 await ——
+    // 慢的一直不回来，界面就一直不开。现在候选会话先开，其余随后异步补。
+    void Promise.allSettled([
+      refreshCatalog(),
+      refreshSidecar().catch(() => undefined),
+      listenDetachedEvents().catch(() => undefined),
+      refreshContext().catch(() => undefined),
+    ]).then(() => {
+      ipc.bootMark("boot:optional-manifests");
+      void ipc.flushBootMarks().catch(() => undefined);
+    });
     const available = rows.value.filter((r) => !r.archived);
     const users = available.filter((r) => r.kind === "user");
     const candidates = users.length ? users : available;
     for (const row of candidates) {
-      if (await tryOpenSession(row.id)) {
+      // 单个会话打开时的意外异常不该中断回退链：记下来，继续试下一个。
+      let opened = false;
+      try {
+        opened = await tryOpenSession(row.id);
+      } catch {
+        opened = false;
+      }
+      if (opened) {
         ipc.bootMark("boot:session-ready", `session=${row.id}`);
         ipc.flushBootMarks();
         return;
@@ -1728,9 +1907,15 @@ export const useSessionStore = defineStore("session", () => {
     settings.value = await ipc.settingsGet();
   }
 
+  // 工作单 2026-10-19 第二版·条目 6：搜索是异步的，连续敲关键词时先发的那条
+  // 可能后回来。没有序号护栏的话，慢的旧查询会把新查询的结果覆盖掉 —— 列表
+  // 显示的是用户早就删掉的输入。每次调用领一个号，回来只对号入座。
+  let searchSeq = 0;
+
   async function search(query: string) {
     searchQuery.value = query;
     const q = query.trim();
+    const seq = ++searchSeq;
     if (!q) {
       searchHits.value = [];
       return;
@@ -1738,7 +1923,15 @@ export const useSessionStore = defineStore("session", () => {
     // 搜索全库，不按空间收窄。侧栏现在列的是**全部**会话，搜索要是只搜一格，用户
     // 明明看着列表里的那条却搜不出来。命中项自带 title/snippet，归属从它所在的分组
     // 看得出来，不需要靠收窄搜索来表达。
-    searchHits.value = await ipc.sessionsSearch(q);
+    try {
+      const hits = await ipc.sessionsSearch(q);
+      if (seq !== searchSeq) return; // 更新的查询已经发出（或已清空），这份过期
+      searchHits.value = hits;
+    } catch (err) {
+      if (seq !== searchSeq) return;
+      error.value = errText(err);
+      searchHits.value = [];
+    }
   }
 
   async function confirmDelete() {
@@ -2874,6 +3067,7 @@ export const useSessionStore = defineStore("session", () => {
     records,
     openIds,
     activeId,
+    pendingOpenId,
     rows,
     projects,
     searchQuery,
@@ -2969,10 +3163,13 @@ export const useSessionStore = defineStore("session", () => {
     confirmDeleteProject,
     pickWorkbenchFolder,
     openSpacesPage,
-    pruneMissingProjects,
+    notifyInaccessibleProjects,
     previewEmptyProjects,
     confirmPruneEmptyProjects,
     openSession,
+    // 带成功/失败返回值的打开入口（openSession 是它的 void 包装）：宿主与测试
+    // 需要知道这次点击最终有没有赢。
+    tryOpenSession,
     loadOlderMessages,
     closeTab,
     detachSession,
@@ -2985,6 +3182,9 @@ export const useSessionStore = defineStore("session", () => {
     stop,
     openLiveTerminal,
     refreshBackgroundProcesses,
+    // 条目 7 的回归入口：测试直接喂 terminal_output_chunk，验证长时间输出下
+    // rec.text 有上限。生产路径仍只由 applyFrame 调用。
+    applyLiveUpdate,
     closeLivePane,
     killLiveTerminal,
     selectFolder,
@@ -3048,6 +3248,9 @@ export const useSessionStore = defineStore("session", () => {
     refreshList,
     refreshProjects,
     refreshCatalog,
+    // 暴露给测试与诊断：lag 事件到重同步的接线（listenBus 里的
+    // "bus-lagged" 监听）以外，重同步本身也要可独立驱动。
+    resyncAfterLag,
     refreshAgentPlugins,
     installAgentPlugin,
     connectAgentPlugin,

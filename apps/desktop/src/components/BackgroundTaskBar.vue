@@ -29,6 +29,7 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { latestOutput } from "../lib/terminal-preview";
 import type { LiveTerminal } from "../lib/types";
 import { useSessionStore } from "../stores/session";
 
@@ -60,17 +61,14 @@ function elapsed(startedAt: number): string {
 }
 
 function statusLabel(job: LiveTerminal): string {
+  // 事件丢帧重同步后仍没有退出帧：任务已结束却看不到结局，如实标注，
+  // 不许继续显示成「运行中」骗人（停止按钮保留，用户可自行了断）。
+  if (job.unverified) return "状态未确认";
   if (!job.exited) return "运行中";
   if (job.status === "killed") return "已停止";
   if (job.exitCode === 0) return "已结束";
   if (job.exitCode != null) return `退出码 ${job.exitCode}`;
   return "已结束";
-}
-
-function latestOutput(text: string): string {
-  const lines = text.trimEnd().split(/\r?\n/).filter(Boolean);
-  const line = lines[lines.length - 1];
-  return line || "暂无输出";
 }
 
 async function stop(id: string) {

@@ -58,7 +58,8 @@ const planName=computed(()=>plans.value.find(p=>p.key===status.value?.profile?.u
 const formatDate=(v:string)=>new Date(v).toLocaleString('zh-CN');
 const message=(e:unknown)=>e instanceof Error?e.message:String(e);
 async function run(fn:()=>Promise<void>){if(busy.value)return;busy.value=true;error.value='';notice.value='';try{await fn()}catch(e){error.value=message(e)}finally{busy.value=false}}
-async function refresh(){status.value=await ipc.accountStatus();setAccountIdentity(status.value);if(status.value.message)error.value=status.value.message;if(status.value.configured){plans.value=await ipc.accountPlans();orders.value=status.value.profile?await ipc.accountOrders():[]}}
+// 用户主动打开账户面板刷新：force=true 绕过启动期的去重缓存，拿最新状态。
+async function refresh(){status.value=await ipc.accountStatus(true);setAccountIdentity(status.value);if(status.value.message)error.value=status.value.message;if(status.value.configured){plans.value=await ipc.accountPlans();orders.value=status.value.profile?await ipc.accountOrders():[]}}
 function switchMode(){mode.value=mode.value==='login'?'register':'login';password.value='';confirmation.value='';error.value='';notice.value=''}
 async function submit(){await run(async()=>{if(mode.value==='register'){if(password.value!==confirmation.value)throw Error('两次输入的密码不一致');await ipc.accountRegister(email.value,name.value,password.value);mode.value='login';notice.value='注册成功，请登录。管理员开通授权后即可使用应用。'}else{const profile=await ipc.accountLogin(email.value,password.value);await refresh();notice.value=profile.deviceWarning||''}password.value='';confirmation.value=''})}
 async function logout(){await run(async()=>{await ipc.accountLogout();await refresh()})}

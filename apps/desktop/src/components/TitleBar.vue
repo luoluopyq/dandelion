@@ -62,7 +62,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { useSessionStore } from "../stores/session";
 import { theme, toggleTheme } from "../lib/theme";
 import { hasPrimaryModifier, isMacOS, shortcut } from "../lib/platform";
-import { accountDisplayName, setAccountIdentity } from "../lib/account-state";
+import { accountDisplayName, accountStatusSnapshot, setAccountIdentity } from "../lib/account-state";
 import { accountStatus } from "../lib/ipc";
 
 const session = useSessionStore();
@@ -121,14 +121,20 @@ async function runEdit(command: "undo" | "redo" | "cut" | "copy" | "paste" | "de
   document.execCommand(command === "selectAll" ? "selectAll" : command, false);
 }
 async function runAction(action: (typeof actions)[number]) { closePalette(); if (action.id === "new") await session.newTask(); else if (action.id === "tasks") session.toggleDock("tasks"); else if (action.id === "project") await session.newProject(); else if (action.id === "workbench") session.openWorkbench(); else if (action.id === "folder") await chooseWorkspace(); else await session.openSettings("common"); }
-async function moveHistory(delta: -1 | 1) { const targetIndex = historyIndex.value + delta; const id = history.value[targetIndex]; if (!id) return; replayingHistory = true; historyIndex.value = targetIndex; await session.openSession(id); replayingHistory = false; }
+// 工作单 2026-10-19 第二版·条目 8：openSession 抛错（会话加载失败）时，裸的
+// 「置位 → await → 复位」会把 replayingHistory 永远卡在 true —— activeId 的
+// watch 从此不再记账，前进/后退历史整个冻结。finally 保证无论成败都复位，
+// 失败后历史导航仍可用（openSession 自己负责报错与释放占用）。
+async function moveHistory(delta: -1 | 1) { const targetIndex = historyIndex.value + delta; const id = history.value[targetIndex]; if (!id) return; replayingHistory = true; historyIndex.value = targetIndex; try { await session.openSession(id); } finally { replayingHistory = false; } }
 function onKeydown(event: KeyboardEvent) { const primary = hasPrimaryModifier(event); if (event.key === "Escape") { closeMenus(); return; } if (event.metaKey && event.ctrlKey && event.key.toLowerCase() === "f") { event.preventDefault(); void toggleFullscreen(); return; } if (event.key === "F11") { event.preventDefault(); void toggleFullscreen(); return; } if (isMacOS && event.metaKey && event.key.toLowerCase() === "q") { event.preventDefault(); close(); return; } if (primary && event.shiftKey && event.key.toLowerCase() === "p") { event.preventDefault(); openPalette(); return; } if (primary && event.key.toLowerCase() === "f") { event.preventDefault(); openPalette(); return; } if (primary && event.key.toLowerCase() === "n") { event.preventDefault(); void session.newTask(); return; } if (primary && event.key.toLowerCase() === "b") { event.preventDefault(); session.toggleDock("tasks"); return; } if (primary && event.shiftKey && event.key.toLowerCase() === "w") { event.preventDefault(); session.toggleWorkbench(); return; } if (primary && event.key.toLowerCase() === "o") { event.preventDefault(); void chooseWorkspace(); return; } if (primary && event.key === ",") { event.preventDefault(); void session.openSettings("common"); } }
 function minimize() { void win.minimize(); }
 function toggleMax() { void win.toggleMaximize(); }
 function onTitlebarDoubleClick(event: MouseEvent) { if (!usesNativeMacChrome && (event.target as HTMLElement | null)?.closest("[data-tauri-drag-region]")) toggleMax(); }
 function close() { if (session.detached) void win.destroy(); else void win.close(); }
 function onDocumentPointer(event: PointerEvent) { if (!(event.target as HTMLElement | null)?.closest(".menu-root")) closeMenus(); }
-onMounted(() => { window.addEventListener("keydown", onKeydown); document.addEventListener("pointerdown", onDocumentPointer); if (!session.detached) void accountStatus().then(setAccountIdentity).catch(() => {}); });
+// 账号身份是全局共享的：App 启动时已取过一次，TitleBar 只在快照还没有时补取，
+// 不再对同一份授权重复发请求（后端另有 TTL 缓存去重，这里是省掉整次 IPC）。
+onMounted(() => { window.addEventListener("keydown", onKeydown); document.addEventListener("pointerdown", onDocumentPointer); if (!session.detached && !accountStatusSnapshot.value) void accountStatus().then(setAccountIdentity).catch(() => {}); });
 onBeforeUnmount(() => { window.removeEventListener("keydown", onKeydown); document.removeEventListener("pointerdown", onDocumentPointer); window.clearTimeout(searchTimer); });
 </script>
 

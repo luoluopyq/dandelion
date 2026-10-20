@@ -88,6 +88,8 @@
               </button>
             </p>
           </template>
+          <!-- 点击到首帧之间：目标对话立刻可见的加载态，不等 occupy/消息两轮 IPC。 -->
+          <p v-if="session.pendingOpenId" class="gen" role="status">正在打开对话…</p>
           <p v-if="session.queued" class="gen" role="status">排队中（等待本地 sidecar 槽）… 停止可出队</p>
           <p v-else-if="session.running" class="gen" role="status">
             <template v-if="!session.messages.length">正在连接模型并准备任务…</template>

@@ -410,7 +410,8 @@ async function initializeAccess(){
   try {
     for (const [name, callback] of [
       ['account-status',(event:{payload:AccountStatus})=>setAccountIdentity(event.payload)],
-      ['account-access-denied',()=>{if(accountStatusSnapshot.value)setAccountIdentity({...accountStatusSnapshot.value,access:null});}],
+      // access-denied 即明确失效：宽限标记必须一并清掉，否则门永远不会出现。
+      ['account-access-denied',()=>{if(accountStatusSnapshot.value)setAccountIdentity({...accountStatusSnapshot.value,access:null,grace:false});}],
     ] as const) {
       const off=await listen(name,callback as (event:any)=>void);
       if(accessDisposed){off();return;}accessListeners.push(off);

@@ -87,6 +87,14 @@
             <button type="button" class="project-open" :aria-expanded="expandedProjects.has(project.id)" @click="selectProject(project.id)">
               <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 3.8h4.1l1.3 1.7h6.6v7.1H2z" /></svg>
               <span>{{ project.name }}</span>
+              <!-- 目录当前读不到（移动盘/网络盘没就位）：只标记，数据原样保留。 -->
+              <span
+                v-if="project.accessible === false"
+                class="project-inaccessible"
+                role="status"
+                title="目录暂时访问不到。对话已原样保留，接上磁盘/网络后自动恢复；确认不再需要请手动删除项目。"
+                >不可访问</span
+              >
               <svg class="project-chevron" viewBox="0 0 16 16" aria-hidden="true" :class="{ expanded: expandedProjects.has(project.id) }"><path d="m6 4 4 4-4 4" /></svg>
             </button>
             <button type="button" class="project-more" title="项目操作" aria-label="项目操作" @click.stop="onProjectMenu($event, project)">

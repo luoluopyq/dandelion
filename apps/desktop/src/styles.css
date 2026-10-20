@@ -3595,6 +3595,12 @@ body.is-resizing-pane * { cursor: col-resize !important; }
 .image-lightbox-close { position: absolute; top: 16px; right: 20px; width: 36px; height: 36px; border: 0; border-radius: 50%; background: rgba(255, 255, 255, 0.14); color: #fff; font-size: 22px; line-height: 1; cursor: pointer; }
 
 /* Project conversations start collapsed; the disclosure stays visible. */
-.conversation-sidebar .project-open { grid-template-columns: 18px minmax(0, 1fr) 12px; }
+.conversation-sidebar .project-open { grid-template-columns: 18px minmax(0, 1fr) auto 12px; }
 .conversation-sidebar .project-open .project-chevron { width: 12px; height: 12px; color: var(--muted); }
 .conversation-sidebar .project-chevron.expanded { transform: rotate(90deg); }
+/* 目录暂时读不到的项目：中性警示徽章，不谎报成删除。数据保留，接上后自动恢复。 */
+.conversation-sidebar .project-inaccessible {
+  justify-self: end; margin-right: 5px; padding: 1px 6px; border-radius: 999px;
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+  color: var(--warn); font-size: var(--fs-2xs); font-weight: 500; white-space: nowrap;
+}

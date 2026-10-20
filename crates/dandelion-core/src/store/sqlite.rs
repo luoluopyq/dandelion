@@ -53,6 +53,10 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at  TEXT NOT NULL,
   FOREIGN KEY(session_id) REFERENCES sessions(id)
 );
+-- Reads are all "latest N messages of one session"; without this index every
+-- such query scans the whole table. SCHEMA re-runs on every open, so adding
+-- the index here also lands on existing databases.
+CREATE INDEX IF NOT EXISTS messages_session_idx ON messages(session_id, id);
 
 CREATE TABLE IF NOT EXISTS message_agent_engines (
   session_id TEXT NOT NULL,
@@ -4322,6 +4326,29 @@ impl Store {
         Ok(project)
     }
 
+    /// 列出某空间删除时将牵连的全部会话 id（含未继承 workspace 的子代理会话）。
+    /// 与 `project_delete` 内联的 doomed CTE 同一条递归定义 —— 宿主在真正删除
+    /// 之前先拿这份名单去取消/等待相关运行任务，名单和实际删除范围必须一致。
+    pub fn project_session_ids(&self, project_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|_| Error::Store("lock".into()))?;
+        let workspace: Option<String> = conn
+            .query_row("SELECT workspace FROM projects WHERE id = ?1", params![project_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(workspace) = workspace else { return Ok(Vec::new()) };
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE doomed(id) AS (
+                 SELECT id FROM sessions WHERE workspace = ?1
+                 UNION
+                 SELECT s.id FROM sessions s JOIN doomed d ON s.parent_id = d.id
+             )
+             SELECT id FROM doomed",
+        )?;
+        let rows = stmt.query_map(params![workspace], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// 删除工作空间。
     ///
     /// `purge_sessions` 为真时把它名下的会话整棵删掉（含子代理会话与消息），
@@ -4447,12 +4474,14 @@ impl Store {
         Ok(project)
     }
 
-    /// 清掉目录已不存在的工作空间条目，连同其名下会话。
+    /// 清掉目录当前不存在的工作空间条目，连同其名下会话。
     ///
-    /// 工作空间就是这个目录本身（`project_create` 已经 canonicalize），目录被
-    /// 外部删除或移走之后，条目只是一个点不开的死书签：既进不去，也没法解释
-    /// 它为什么还在，所以直接清掉，而不是灰在那儿。返回被清掉的空间，调用方
-    /// 可以据此告诉用户发生了什么 —— 这类清理是自动发生的，不能一声不吭。
+    /// **危险：只在用户显式点「删除此空间」之类的动作里调用，绝不在启动或
+    /// 列表刷新时自动调用。**「目录现在读不到」不等于「用户不要这个空间」：
+    /// 移动盘没插、网络盘没连、盘符晚到，都会让 `is_dir()` 短暂为假，而这里
+    /// 一删就是连会话带消息一起物理删除，恢复不回来。读不到时的正确表现是
+    /// 在列表里标成不可访问（见桌面层 `projects_list` 的 `accessible` 字段），
+    /// 数据原地保留。返回被清掉的空间，调用方必须把删除结果告诉用户。
     pub fn projects_prune_missing(&self) -> Result<Vec<ProjectRow>> {
         let mut removed = Vec::new();
         for project in self.projects_list()? {
@@ -4504,11 +4533,18 @@ impl Store {
         Ok(doomed)
     }
 
-    /// `workspace` 为 `Some` 时只在那个工作空间内搜。
+    /// 按标题 **或** 消息正文搜会话；`workspace` 为 `Some` 时只在那个工作空间内搜。
     ///
     /// 会话按工作空间隔离之后，搜索必须跟着收窄：侧栏写着「只属于这个空间」，
     /// 搜索框却能把别的空间的对话捞出来，隔离就是假的。`None` 不限，留给 CLI
     /// 这类没有「当前空间」概念的调用方。
+    ///
+    /// 工作单 2026-10-19 第二版·条目 6 钉死的三条口径：
+    /// - 只搜正文是不够的：用户记标题的时刻不比记内容少，标题命中同样是命中；
+    /// - 分页按**会话**数，不按消息行数 —— 旧写法 LIMIT 先砍消息行、回到 Rust
+    ///   才去重，一个命中几十条的会话能把整页其他会话全挤出去；
+    /// - `snippet` 是限长摘要，不是整条消息原文 —— 命中长文本时不许把
+    ///   IPC 载荷当快递寄。
     pub fn sessions_search(
         &self,
         query: &str,
@@ -4517,12 +4553,20 @@ impl Store {
     ) -> Result<Vec<SessionSearchHit>> {
         let needle = like_contains(query);
         let conn = self.conn.lock().map_err(|_| Error::Store("lock".into()))?;
+        // 每会话一行：EXISTS 判命中、相关子查询取最近一条命中消息做摘要原料，
+        // LIMIT 作用在会话上。正文子查询走 messages(session_id) 索引，
+        // 按会话收窄后再 LIKE，不再全表扫。
         let mut stmt = conn.prepare(
-            "SELECT s.id, s.title, s.updated_at, m.content
-             FROM messages m
-             JOIN sessions s ON s.id = m.session_id
-             WHERE m.content LIKE ?1 ESCAPE '\\' AND (?3 IS NULL OR s.workspace = ?3)
-             ORDER BY s.updated_at DESC, m.id DESC
+            "SELECT s.id, s.title, s.updated_at,
+                    (SELECT m.content FROM messages m
+                      WHERE m.session_id = s.id AND m.content LIKE ?1 ESCAPE '\\'
+                      ORDER BY m.id DESC LIMIT 1)
+             FROM sessions s
+             WHERE (?3 IS NULL OR s.workspace = ?3)
+               AND (s.title LIKE ?1 ESCAPE '\\'
+                    OR EXISTS (SELECT 1 FROM messages m2
+                                WHERE m2.session_id = s.id AND m2.content LIKE ?1 ESCAPE '\\'))
+             ORDER BY s.updated_at DESC
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![needle, limit as i64, workspace], |row| {
@@ -4530,17 +4574,13 @@ impl Store {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 updated_at: row.get(2)?,
-                snippet: row.get(3)?,
+                snippet: row
+                    .get::<_, Option<String>>(3)?
+                    .map(|body| search_snippet(&body, query))
+                    .unwrap_or_default(),
             })
         })?;
-        let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for row in rows {
-            let hit = row?;
-            if seen.insert(hit.id.clone()) {
-                out.push(hit);
-            }
-        }
+        let out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(out)
     }
 
@@ -6139,6 +6179,51 @@ fn like_contains(query: &str) -> String {
     out
 }
 
+/// 摘要长度上限（字符数）：命中长文本时，侧栏要的是"看到那句上下文"，
+/// 不是整条消息 —— 一次搜索返回 limit 条，每条都拖全文的话，搜索结果
+/// 本身就成了新的载荷瓶颈。与 jobs.rs 的 preview 同口径：小显示参数，
+/// 不进 Settings。
+const SEARCH_SNIPPET_CHARS: usize = 200;
+/// 命中点之前保留的上下文字符数；之后的额度 = 总长 - 前文 - 命中词。
+const SEARCH_SNIPPET_CONTEXT: usize = 80;
+
+/// 从命中消息里裁一段限长摘要：折叠换行（侧栏单行展示），把窗口居中到
+/// 命中点，前后视截断情况补省略号。找不到命中词（LIKE 的大小写口径与
+/// ASCII find 不完全重合时）退回从头截取。
+fn search_snippet(content: &str, needle: &str) -> String {
+    let flat: String = content
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let key = needle.trim().to_lowercase();
+    let hit = if key.is_empty() {
+        0
+    } else {
+        flat.to_lowercase().find(&key).unwrap_or(0)
+    };
+    // to_lowercase 对个别字符（如 'İ'）会改长度，字节下标可能落在多字节
+    // 字符中间 —— 退到最近的合法边界，找不到就从头截，摘要不讲究这个。
+    let mut hit = hit.min(flat.len());
+    while hit > 0 && !flat.is_char_boundary(hit) {
+        hit -= 1;
+    }
+    let before = flat[..hit]
+        .chars()
+        .count()
+        .saturating_sub(SEARCH_SNIPPET_CONTEXT);
+    let taken: String = flat.chars().skip(before).take(SEARCH_SNIPPET_CHARS).collect();
+    let rest = flat.chars().count() - before - taken.chars().count();
+    let mut out = String::with_capacity(taken.len() + 2);
+    if before > 0 {
+        out.push('…');
+    }
+    out.push_str(&taken);
+    if rest > 0 {
+        out.push('…');
+    }
+    out
+}
+
 /// 一次性清理历史脏数据：旧版目录选择器把 Windows 的 `\\?\` 扩展长度拼写写进了
 /// `sessions.workspace` 列与 prefs JSON 的 workspace 字段，而 `projects.workspace`
 /// 一直是剥掉前缀的用户可见拼写。侧栏分组按精确相等匹配，这些对话于是永远回不到
@@ -7160,6 +7245,113 @@ mod tests {
         assert_eq!(hits.len(), 1);
         let miss = store.sessions_search("100_", None, 50).unwrap();
         assert!(miss.is_empty());
+    }
+
+    /// 工作单条目 6：标题命中同样是命中。正文里一次都没有的词，只要标题
+    /// 含它，会话就必须出现在结果里（旧实现只 JOIN messages，标题永远搜不到）。
+    #[test]
+    fn search_matches_session_title_without_any_body_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), 5000).unwrap();
+        let hit = SessionId::new();
+        let miss = SessionId::new();
+        store.ensure_session(&hit, dir.path(), "季度复盘会议").unwrap();
+        store.append_user(&hit, "随便聊了点别的", &MessageId::new()).unwrap();
+        store.ensure_session(&miss, dir.path(), "周报").unwrap();
+        store.append_user(&miss, "也随便", &MessageId::new()).unwrap();
+
+        let hits = store.sessions_search("复盘", None, 50).unwrap();
+        assert_eq!(hits.len(), 1, "标题命中必须进结果");
+        assert_eq!(hits[0].id, hit.as_str());
+        assert!(hits[0].snippet.is_empty(), "纯标题命中没有正文摘要");
+    }
+
+    /// 工作单条目 6：分页按会话数。一个会话命中 30 条消息、另一个命中 1 条，
+    /// limit=2 必须两个会话都回来 —— 旧实现 LIMIT 砍在消息行上，热门会话
+    /// 的 30 行能把整页挤满，第二个会话根本轮不到。
+    #[test]
+    fn search_paginates_by_session_not_by_message_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), 5000).unwrap();
+        let many = SessionId::new();
+        let one = SessionId::new();
+        store.ensure_session(&many, dir.path(), "热门会话").unwrap();
+        store.ensure_session(&one, dir.path(), "冷门会话").unwrap();
+        for i in 0..30 {
+            store
+                .append_user(&many, &format!("第 {i} 次提到 蒲公英 的上下文"), &MessageId::new())
+                .unwrap();
+        }
+        store
+            .append_user(&one, "只提过一次 蒲公英", &MessageId::new())
+            .unwrap();
+        // 确定性排序：many 更新（写死两值，不依赖真实时钟），
+        // 旧实现下 LIMIT 2 只会命中 many 的两行消息。
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE sessions SET updated_at = '2026-06-02T00:00:00+00:00' WHERE id = ?1",
+                params![many.as_str()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions SET updated_at = '2026-06-01T00:00:00+00:00' WHERE id = ?1",
+                params![one.as_str()],
+            )
+            .unwrap();
+        }
+
+        let hits = store.sessions_search("蒲公英", None, 2).unwrap();
+        assert_eq!(hits.len(), 2, "limit 数的是会话，不是消息行");
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec![many.as_str(), one.as_str()], "按 updated_at 降序、每会话一行");
+    }
+
+    /// 工作单条目 6：摘要限长，且窗口要绕到命中点 —— 长消息命中在中间时，
+    /// 从头截 200 字符用户什么都看不见。
+    #[test]
+    fn search_snippet_is_bounded_and_centered_on_the_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), 5000).unwrap();
+        let sid = SessionId::new();
+        store.ensure_session(&sid, dir.path(), "长输出").unwrap();
+        let body = format!("{} 蒲公英 {} ", "前".repeat(2000), "后".repeat(2000));
+        store.append_user(&sid, &body, &MessageId::new()).unwrap();
+
+        let hits = store.sessions_search("蒲公英", None, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let snippet = &hits[0].snippet;
+        assert!(snippet.contains("蒲公英"), "窗口必须盖住命中点，不是从头截");
+        assert!(
+            snippet.chars().count() <= SEARCH_SNIPPET_CHARS + 2,
+            "摘要必须限长: {} 字符",
+            snippet.chars().count()
+        );
+        assert!(snippet.starts_with('…') && snippet.ends_with('…'), "两头截断都要有省略号");
+    }
+
+    /// 新增行为在 workspace 收窄下同样成立：别的空间里标题再像也不许漏进来。
+    #[test]
+    fn search_stays_scoped_to_workspace_after_rework() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws1 = dir.path().join("ws1");
+        let ws2 = dir.path().join("ws2");
+        std::fs::create_dir_all(&ws1).unwrap();
+        std::fs::create_dir_all(&ws2).unwrap();
+        let store = Store::open(dir.path(), 5000).unwrap();
+        let in1 = SessionId::new();
+        let in2 = SessionId::new();
+        store.ensure_session(&in1, &ws1, "蒲公英栽培").unwrap();
+        store.ensure_session(&in2, &ws2, "蒲公英栽培").unwrap();
+        let scope = store
+            .get_session(&in1)
+            .unwrap()
+            .expect("row")
+            .workspace;
+
+        let hits = store.sessions_search("蒲公英", Some(&scope), 50).unwrap();
+        assert_eq!(hits.len(), 1, "搜索结果不得跨空间泄漏");
+        assert_eq!(hits[0].id, in1.as_str());
     }
 
     #[test]
